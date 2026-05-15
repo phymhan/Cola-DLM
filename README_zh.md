@@ -306,6 +306,18 @@ cola-dlm/
 
 ---
 
+## Star 历史
+
+<a href="https://www.star-history.com/?repos=ByteDance-Seed%2FCola-DLM&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=ByteDance-Seed/Cola-DLM&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=ByteDance-Seed/Cola-DLM&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=ByteDance-Seed/Cola-DLM&type=date&legend=top-left" />
+ </picture>
+</a>
+
+---
+
 ## 引用
 
 如果 Cola DLM 对你的研究有帮助，请引用论文：
