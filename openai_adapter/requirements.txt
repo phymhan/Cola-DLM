@@ -1,0 +1,5 @@
+# Extra dependencies for the OpenAI-compatible HTTP adapter.
+
+fastapi>=0.110
+uvicorn[standard]>=0.29
+

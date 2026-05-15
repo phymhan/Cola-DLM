@@ -1,0 +1,24 @@
+Cola DLM
+Copyright (c) 2025 ByteDance Ltd. and/or its affiliates
+
+This product includes software developed by ByteDance Ltd. and/or its affiliates.
+
+Licensed under the Apache License, Version 2.0 (the "License"); see the
+accompanying LICENSE file for the full text.
+
+Third-party notices
+-------------------
+
+This project depends on the following open source projects, each
+distributed under its own license:
+
+* PyTorch (https://github.com/pytorch/pytorch) — BSD-3-Clause
+* HuggingFace Transformers (https://github.com/huggingface/transformers) — Apache-2.0
+* HuggingFace Tokenizers (https://github.com/huggingface/tokenizers) — Apache-2.0
+* einops (https://github.com/arogozhnikov/einops) — MIT
+* NumPy (https://numpy.org/) — BSD-3-Clause
+* safetensors (https://github.com/huggingface/safetensors) — Apache-2.0
+
+Portions of the model architecture and diffusion schedule are inspired by
+the broader DiT / text-diffusion research literature; see
+docs/architecture.md for references.

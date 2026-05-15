@@ -1,0 +1,107 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cola-dlm"
+version = "0.1.0"
+description = "Cola DLM — Continuous Latent Diffusion Language Model: a hierarchical latent-space text diffusion model with a block-causal DiT prior over a Text VAE; official open-source inference code (arXiv:2605.06548)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Cola DLM Contributors" },
+]
+keywords = [
+    "diffusion",
+    "language-model",
+    "text-generation",
+    "transformers",
+    "pytorch",
+    "dit",
+    "vae",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.40",
+    "tokenizers>=0.15",
+    "einops>=0.7",
+    "numpy>=1.24",
+    "safetensors>=0.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.4",
+    "black>=24.0",
+    "pre-commit>=3.0",
+]
+serve = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/cola-dlm"
+Repository = "https://github.com/your-org/cola-dlm"
+Documentation = "https://github.com/your-org/cola-dlm/tree/main/docs"
+Issues = "https://github.com/your-org/cola-dlm/issues"
+
+[project.scripts]
+cola-dlm-infer = "cola_dlm.inference:main"
+cola-dlm-openai-server = "openai_adapter.server:main"
+
+[tool.setuptools.packages.find]
+include = ["cola_dlm*", "openai_adapter*"]
+exclude = [
+    "tests*",
+    "docs*",
+    "examples*",
+    "scripts*",
+    "eval_output*",
+    "generate_task_data*",
+]
+
+[tool.setuptools.package-data]
+cola_dlm = ["py.typed"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",  # line too long (we use line-length=120 + some long strings in prompts)
+    "E741",  # ambiguous variable name (l, I used intentionally for lengths etc.)
+    "B008",  # function calls in argument defaults (argparse pattern)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"cola_dlm/inference.py" = ["E501"]
+
+[tool.black]
+line-length = 120
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q"
+testpaths = ["tests"]

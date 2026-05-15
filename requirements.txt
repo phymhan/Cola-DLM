@@ -1,0 +1,11 @@
+# Runtime dependencies for Cola DLM inference.
+#
+# Pinning strategy: lower bounds only. The codebase is tested against
+# PyTorch 2.1+ and Transformers 4.40+; newer versions are expected to work.
+
+torch>=2.1
+transformers>=4.40
+tokenizers>=0.15
+einops>=0.7
+numpy>=1.24
+safetensors>=0.4
