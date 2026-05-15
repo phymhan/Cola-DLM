@@ -26,7 +26,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from fastapi import FastAPI, Header, HTTPException
@@ -52,7 +52,7 @@ def _env_float(name: str, default: float) -> float:
     return float(value)
 
 
-def _env_optional_int(name: str, default: Optional[int] = None) -> Optional[int]:
+def _env_optional_int(name: str, default: int | None = None) -> int | None:
     value = os.environ.get(name)
     if value is None or value == "":
         return default
@@ -65,7 +65,7 @@ class AdapterSettings:
     vae_path: str
     tokenizer_path: str
     model_name: str = "cola-dlm"
-    api_key: Optional[str] = None
+    api_key: str | None = None
     device: str = "auto"
     default_max_new_tokens: int = 32
     max_new_tokens_limit: int = 4096
@@ -75,11 +75,11 @@ class AdapterSettings:
     top_p: float = 0.9
     repetition_penalty: float = 1.1
     pad_token_id: int = 100277
-    eos_token_id: Optional[int] = 100257
-    im_end_token_id: Optional[int] = 100265
+    eos_token_id: int | None = 100257
+    im_end_token_id: int | None = 100265
 
     @classmethod
-    def from_env(cls) -> "AdapterSettings":
+    def from_env(cls) -> AdapterSettings:
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         return cls(
             dit_path=os.environ.get("COLA_DIT_PATH", os.path.join(repo_root, "hf_models/cola_dlm/cola_dit")),
@@ -113,11 +113,11 @@ class ChatCompletionRequest(BaseModel):
     model: str = Field(default="cola-dlm")
     messages: list[ChatMessage]
     temperature: float = 0.0
-    max_tokens: Optional[int] = 4096
+    max_tokens: int | None = 4096
     stream: bool = False
-    top_p: Optional[float] = None
+    top_p: float | None = None
     n: int = 1
-    top_k: Optional[int] = None
+    top_k: int | None = None
 
     class Config:
         extra = "allow"
@@ -156,8 +156,8 @@ class ColaOpenAIAdapter:
         prompt: str,
         max_new_tokens: int,
         temperature: float,
-        top_p: Optional[float],
-        top_k: Optional[int],
+        top_p: float | None,
+        top_k: int | None,
     ) -> str:
         with self._lock:
             results = generate_task_repaint_inference(
@@ -245,7 +245,7 @@ def _openai_error(status_code: int, message: str, error_type: str = "invalid_req
     )
 
 
-def _check_api_key(expected_key: Optional[str], authorization: Optional[str]) -> None:
+def _check_api_key(expected_key: str | None, authorization: str | None) -> None:
     if not expected_key:
         return
     if authorization != f"Bearer {expected_key}":
@@ -267,7 +267,7 @@ def health() -> dict[str, Any]:
 
 
 @app.get("/v1/models")
-def list_models(authorization: Optional[str] = Header(default=None)) -> dict[str, Any]:
+def list_models(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     _check_api_key(settings.api_key, authorization)
     created = int(time.time())
     return {
@@ -286,7 +286,7 @@ def list_models(authorization: Optional[str] = Header(default=None)) -> dict[str
 @app.post("/v1/chat/completions")
 async def create_chat_completion(
     request: ChatCompletionRequest,
-    authorization: Optional[str] = Header(default=None),
+    authorization: str | None = Header(default=None),
 ) -> JSONResponse:
     _check_api_key(settings.api_key, authorization)
 
@@ -295,7 +295,9 @@ async def create_chat_completion(
     if request.n != 1:
         return _openai_error(400, "Only n=1 is supported")
     if request.model and request.model != settings.model_name:
-        return _openai_error(404, f"Unknown model {request.model!r}; expected {settings.model_name!r}", "not_found_error")
+        return _openai_error(
+            404, f"Unknown model {request.model!r}; expected {settings.model_name!r}", "not_found_error"
+        )
 
     prompt = _messages_to_prompt(request.messages)
     max_new_tokens = request.max_tokens or settings.default_max_new_tokens

@@ -57,23 +57,21 @@ The public API is a list-in / list-out variant:
 import math
 from collections.abc import MutableMapping
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Optional
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
-from transformers import PreTrainedModel
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig, AutoModel, PreTrainedModel
 
-from .configuration_cola_vae import ColaTextVAEConfig
 from .attention_utils import create_na_block_causal_mask
-
+from .configuration_cola_vae import ColaTextVAEConfig
 
 # ---------------------------------------------------------------------------
 # DiagonalGaussianDistribution
 # ---------------------------------------------------------------------------
+
 
 class DiagonalGaussianDistribution:
     def __init__(self, parameters: torch.Tensor, deterministic: bool = False):
@@ -106,18 +104,20 @@ class DiagonalGaussianDistribution:
 # Encoder / Decoder output dataclasses
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class TextVAEEncoderOutput:
     # ``latents_list[i]`` has shape ``(n_i, latent_dim)``.
-    latents_list: List[torch.Tensor]
+    latents_list: list[torch.Tensor]
     # ``latent_dists[i]`` is the posterior over sample ``i`` (None when
     # ``use_variation=False``).
-    latent_dists: Optional[List[DiagonalGaussianDistribution]] = None
+    latent_dists: Optional[list[DiagonalGaussianDistribution]] = None
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 class BufferCache(dict, MutableMapping[str, torch.Tensor]):
     pass
@@ -130,9 +130,7 @@ def _build_na_positions(txt_shape: torch.LongTensor) -> torch.Tensor:
     return torch.cat(parts).unsqueeze(0)
 
 
-def _build_na_q_positions(
-    txt_shape: torch.LongTensor, txt_q_shape: torch.LongTensor
-) -> torch.Tensor:
+def _build_na_q_positions(txt_shape: torch.LongTensor, txt_q_shape: torch.LongTensor) -> torch.Tensor:
     """Per-sample Q positions aligned to the TAIL of K within each sample."""
     parts = []
     for k_len, q_len in zip(txt_shape.flatten().tolist(), txt_q_shape.flatten().tolist()):
@@ -143,6 +141,7 @@ def _build_na_q_positions(
 # ---------------------------------------------------------------------------
 # VAE Rotary Embedding (NA-capable)
 # ---------------------------------------------------------------------------
+
 
 class VAERotaryEmbedding(nn.Module):
     """Sin/cos RoPE with an explicit ``positions`` argument so the same
@@ -155,7 +154,7 @@ class VAERotaryEmbedding(nn.Module):
         self.full_precision = full_precision
         self.__cache = cache if cache is not None else BufferCache()
 
-    def get_rotary_embedding(self, seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_rotary_embedding(self, seq_len: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         if (
             (pos_sin := self.__cache.get("rope_pos_sin")) is not None
             and (pos_cos := self.__cache.get("rope_pos_cos")) is not None
@@ -172,9 +171,7 @@ class VAERotaryEmbedding(nn.Module):
 
         with torch.autocast(device.type, enabled=False):
             dim = self.head_dim
-            inv_freq = 1.0 / (
-                self.rope_theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float) / dim)
-            )
+            inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float) / dim))
             seq = torch.arange(seq_len, device=device, dtype=torch.float)
             freqs = torch.einsum("i , j -> i j", seq, inv_freq)
             positions = torch.cat((freqs, freqs), dim=-1)
@@ -200,7 +197,7 @@ class VAERotaryEmbedding(nn.Module):
         k: torch.Tensor,  # (1, h, L_k, c)
         q_positions: torch.Tensor,  # (1, L_q) absolute positions for Q
         k_positions: torch.Tensor,  # (1, L_k) absolute positions for K
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         q_ = q.float() if self.full_precision else q
         k_ = k.float() if self.full_precision else k
 
@@ -227,6 +224,7 @@ class VAERotaryEmbedding(nn.Module):
 # ---------------------------------------------------------------------------
 # SwiGLU / norm builder
 # ---------------------------------------------------------------------------
+
 
 class SwiGLU(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -257,6 +255,7 @@ def init_normal(module, std: float, init_cutoff_factor: Optional[float] = None):
 # ---------------------------------------------------------------------------
 # TextVAEBlock — transformer block for encoder/decoder (NA form)
 # ---------------------------------------------------------------------------
+
 
 class TextVAEBlock(nn.Module):
     def __init__(
@@ -312,8 +311,10 @@ class TextVAEBlock(nn.Module):
             self.k_norm = build_norm_layer(layer_norm_type, dim // shared_heads_kv, layer_norm_eps, qk_norm_affine)
 
         self.rope = VAERotaryEmbedding(
-            rope_theta=rope_theta, head_dim=self.head_dim,
-            full_precision=rope_full_precision, cache=self.__cache,
+            rope_theta=rope_theta,
+            head_dim=self.head_dim,
+            full_precision=rope_full_precision,
+            cache=self.__cache,
         )
         self.attn_out_proj = nn.Linear(dim, dim, bias=bias)
         self.dropout_layer = nn.Dropout(dropout)
@@ -323,13 +324,14 @@ class TextVAEBlock(nn.Module):
         self.ffn_act = self._build_act(act)
         self.ffn_out = nn.Linear(
             int(getattr(self.ffn_act, "output_multiplier", 1.0) * ffn_dim),
-            dim, bias=bias,
+            dim,
+            bias=bias,
         )
 
         # Per-sample KV cache (one ``(l_i_cum, d)`` tensor per sample). None
         # means "fresh cache".
-        self._k_cache: Optional[List[torch.Tensor]] = None
-        self._v_cache: Optional[List[torch.Tensor]] = None
+        self._k_cache: Optional[list[torch.Tensor]] = None
+        self._v_cache: Optional[list[torch.Tensor]] = None
         self.reset_parameters()
 
     def _build_act(self, act):
@@ -384,10 +386,10 @@ class TextVAEBlock(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,                    # (1, L_q_total, d)
-        txt_shape: torch.LongTensor,        # (B, 1) K length per sample
-        txt_q_shape: torch.LongTensor,      # (B, 1) Q length per sample
-        attn_block_mask: torch.Tensor,      # (1, 1, L_q, L_k)
+        x: torch.Tensor,  # (1, L_q_total, d)
+        txt_shape: torch.LongTensor,  # (B, 1) K length per sample
+        txt_q_shape: torch.LongTensor,  # (B, 1) Q length per sample
+        attn_block_mask: torch.Tensor,  # (1, 1, L_q, L_k)
         update_kv: bool = False,
     ) -> torch.Tensor:
         if self.post_norm:
@@ -415,12 +417,8 @@ class TextVAEBlock(nn.Module):
             full_k = torch.cat(self._k_cache, dim=0).unsqueeze(0)
             full_v = torch.cat(self._v_cache, dim=0).unsqueeze(0)
         elif self._k_cache is not None:
-            full_k = torch.cat(
-                [torch.cat([c, n], dim=0) for c, n in zip(self._k_cache, new_ks)], dim=0
-            ).unsqueeze(0)
-            full_v = torch.cat(
-                [torch.cat([c, n], dim=0) for c, n in zip(self._v_cache, new_vs)], dim=0
-            ).unsqueeze(0)
+            full_k = torch.cat([torch.cat([c, n], dim=0) for c, n in zip(self._k_cache, new_ks)], dim=0).unsqueeze(0)
+            full_v = torch.cat([torch.cat([c, n], dim=0) for c, n in zip(self._v_cache, new_vs)], dim=0).unsqueeze(0)
         else:
             full_k = k
             full_v = v
@@ -441,8 +439,9 @@ class TextVAEBlock(nn.Module):
         q, full_k = self.rope(q, full_k, q_positions=q_positions, k_positions=k_positions)
 
         # -- Attention -----------------------------------------------------------
-        o = self.slow_attn(q, full_k, full_v, attn_mask=attn_block_mask,
-                           dropout_p=self.attn_dropout if self.training else 0.0)
+        o = self.slow_attn(
+            q, full_k, full_v, attn_mask=attn_block_mask, dropout_p=self.attn_dropout if self.training else 0.0
+        )
         o = rearrange(o, "b h l c -> b l (h c)")
         attn = self.attn_out_proj(o)
 
@@ -466,6 +465,7 @@ class TextVAEBlock(nn.Module):
 # ---------------------------------------------------------------------------
 # Main Model: ColaTextVAEModel
 # ---------------------------------------------------------------------------
+
 
 class ColaTextVAEModel(PreTrainedModel):
     config_class = ColaTextVAEConfig
@@ -525,18 +525,23 @@ class ColaTextVAEModel(PreTrainedModel):
         else:
             encoder_dict["final_layer"] = nn.Linear(config.dim, config.latent_dim, bias=config.bias)
             encoder_dict["final_norm"] = build_norm_layer(
-                config.layer_norm_type, config.latent_dim, config.layer_norm_eps, False,
+                config.layer_norm_type,
+                config.latent_dim,
+                config.layer_norm_eps,
+                False,
             )
 
         self.encoder = nn.ModuleDict(encoder_dict)
 
-        self.decoder = nn.ModuleDict(dict(
-            in_layer=nn.Linear(config.latent_dim, config.dim, bias=config.bias),
-            blocks=nn.ModuleList([TextVAEBlock(**block_kwargs) for _ in range(config.decoder_num_blocks)]),
-            unpatch_layer=nn.Linear(config.dim, config.patch_size * config.dim),
-            final_norm=build_norm_layer(config.layer_norm_type, config.dim, config.layer_norm_eps),
-            final_layer=nn.Linear(config.dim, config.vocab_size, bias=config.bias),
-        ))
+        self.decoder = nn.ModuleDict(
+            dict(
+                in_layer=nn.Linear(config.latent_dim, config.dim, bias=config.bias),
+                blocks=nn.ModuleList([TextVAEBlock(**block_kwargs) for _ in range(config.decoder_num_blocks)]),
+                unpatch_layer=nn.Linear(config.dim, config.patch_size * config.dim),
+                final_norm=build_norm_layer(config.layer_norm_type, config.dim, config.layer_norm_eps),
+                final_layer=nn.Linear(config.dim, config.vocab_size, bias=config.bias),
+            )
+        )
 
         self.post_init()
 
@@ -555,7 +560,7 @@ class ColaTextVAEModel(PreTrainedModel):
     # NA encode
     # ---------------------------------------------------------------
 
-    def _encode_patch_per_sample(self, input_ids_list: List[torch.Tensor]) -> List[torch.Tensor]:
+    def _encode_patch_per_sample(self, input_ids_list: list[torch.Tensor]) -> list[torch.Tensor]:
         """Run embedding + patch ``Conv1d`` one sample at a time.
 
         ``nn.Conv1d`` requires a fixed length within a batch; looping
@@ -563,16 +568,16 @@ class ColaTextVAEModel(PreTrainedModel):
         downstream transformer blocks and lets the subsequent path stay
         pure NA.
         """
-        out_list: List[torch.Tensor] = []
+        out_list: list[torch.Tensor] = []
         for ids in input_ids_list:
-            x = self.encoder.wte(ids.unsqueeze(0))           # (1, L_i, d)
-            x = x.permute(0, 2, 1)                            # (1, d, L_i)
-            x = self.encoder.patch_embedder(x)                # (1, d, n_i)
-            x = x.permute(0, 2, 1).squeeze(0)                 # (n_i, d)
+            x = self.encoder.wte(ids.unsqueeze(0))  # (1, L_i, d)
+            x = x.permute(0, 2, 1)  # (1, d, L_i)
+            x = self.encoder.patch_embedder(x)  # (1, d, n_i)
+            x = x.permute(0, 2, 1).squeeze(0)  # (n_i, d)
             out_list.append(x)
         return out_list
 
-    def encode(self, input_ids_list: List[torch.Tensor]) -> TextVAEEncoderOutput:
+    def encode(self, input_ids_list: list[torch.Tensor]) -> TextVAEEncoderOutput:
         """Encode per-sample ``input_ids`` into per-sample latents.
 
         Realizes the inference encoder ``q_phi(z_0 | x)`` of Eq. 2.1.1
@@ -585,12 +590,13 @@ class ColaTextVAEModel(PreTrainedModel):
         ``patch_size * block_size`` (the per-sample block alignment pad
         still applies because of the patch ``Conv1d``).
         """
-        per_sample = self._encode_patch_per_sample(input_ids_list)    # List[(n_i, d)]
+        per_sample = self._encode_patch_per_sample(input_ids_list)  # List[(n_i, d)]
         txt_shape = torch.tensor(
             [[x.shape[0]] for x in per_sample],
-            dtype=torch.long, device=per_sample[0].device,
+            dtype=torch.long,
+            device=per_sample[0].device,
         )
-        x = torch.cat(per_sample, dim=0).unsqueeze(0)                 # (1, L_total, d)
+        x = torch.cat(per_sample, dim=0).unsqueeze(0)  # (1, L_total, d)
 
         attn_mask = None
         if self.block_causal:
@@ -620,14 +626,14 @@ class ColaTextVAEModel(PreTrainedModel):
             x = self.encoder.final_norm(x)
 
         # Split back to per-sample latents.
-        latents_flat = x.squeeze(0)                                    # (L_total, latent_dim_out)
+        latents_flat = x.squeeze(0)  # (L_total, latent_dim_out)
         split_sizes = txt_shape.flatten().tolist()
         per_sample_latents = list(latents_flat.split(split_sizes, dim=0))
 
-        latent_dists: Optional[List[DiagonalGaussianDistribution]] = None
+        latent_dists: Optional[list[DiagonalGaussianDistribution]] = None
         if self.use_variation:
             latent_dists = [DiagonalGaussianDistribution(p) for p in per_sample_latents]
-            latents_mode = [d.mode() for d in latent_dists]             # mean only
+            latents_mode = [d.mode() for d in latent_dists]  # mean only
         else:
             latents_mode = per_sample_latents
 
@@ -639,9 +645,9 @@ class ColaTextVAEModel(PreTrainedModel):
 
     def decode(
         self,
-        z: torch.Tensor,                 # (L_q_total, latent_dim)
-        txt_shape: torch.LongTensor,     # (B, 1) K length per sample
-        txt_q_shape: torch.LongTensor,   # (B, 1) Q length per sample
+        z: torch.Tensor,  # (L_q_total, latent_dim)
+        txt_shape: torch.LongTensor,  # (B, 1) K length per sample
+        txt_q_shape: torch.LongTensor,  # (B, 1) Q length per sample
         update_kv: bool = False,
     ) -> torch.Tensor:
         """Decode flattened latents into vocabulary logits.
@@ -657,7 +663,7 @@ class ColaTextVAEModel(PreTrainedModel):
         can reshape / split per sample.
         """
         z = self.decoder.in_layer(z)
-        z = z.unsqueeze(0)                                            # (1, L_q_total, d)
+        z = z.unsqueeze(0)  # (1, L_q_total, d)
 
         attn_mask = None
         if self.block_causal:
@@ -678,7 +684,7 @@ class ColaTextVAEModel(PreTrainedModel):
                 update_kv=update_kv,
             )
 
-        z = self.decoder.unpatch_layer(z)                             # (1, L_q, d*patch_size)
+        z = self.decoder.unpatch_layer(z)  # (1, L_q, d*patch_size)
         z = rearrange(z, "b l (c ps) -> b (l ps) c", ps=self.patch_size)
         z = self.decoder.final_norm(z)
         z = self.decoder.final_layer(z)
@@ -699,12 +705,13 @@ class ColaTextVAEModel(PreTrainedModel):
     # encode/decode flow, but PreTrainedModel requires a ``forward``.
     # ---------------------------------------------------------------
 
-    def forward(self, input_ids_list: List[torch.Tensor]):
+    def forward(self, input_ids_list: list[torch.Tensor]):
         enc = self.encode(input_ids_list)
         latents_cat = torch.cat(enc.latents_list, dim=0)
         txt_shape = torch.tensor(
             [[l.shape[0]] for l in enc.latents_list],
-            dtype=torch.long, device=latents_cat.device,
+            dtype=torch.long,
+            device=latents_cat.device,
         )
         preds = self.decode(latents_cat, txt_shape=txt_shape, txt_q_shape=txt_shape)
         return enc, preds

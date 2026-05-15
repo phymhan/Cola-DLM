@@ -67,30 +67,26 @@ inference therefore sees the same flattened layout as the original
 trainer and does not need a separate pad-offset correction term.
 """
 
+import math
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Union
 
-import math
 import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
-from transformers import PreTrainedModel
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig, AutoModel, PreTrainedModel
 
-from .configuration_cola_dit import ColaDiTConfig
 from .attention_utils import (
     create_na_block_causal_mask,
-    cu_seqlens,
-    get_seqlen,
-    max_seqlen,
 )
-
+from .configuration_cola_dit import ColaDiTConfig
 
 # ---------------------------------------------------------------------------
 # Variable-length sequence helpers (NA / flatten-concat layout)
 # ---------------------------------------------------------------------------
+
 
 def _flatten(hid_list):
     """``List[Tensor(*_, c)]`` → ``(Tensor(L_total, c), txt_shape (B, 1))``."""
@@ -110,6 +106,7 @@ def _unflatten(hid, hid_shape):
 # Timestep Embedding (pure PyTorch, no diffusers dependency)
 # ---------------------------------------------------------------------------
 
+
 def _get_sinusoidal_embedding(
     timesteps: torch.Tensor,
     embedding_dim: int,
@@ -125,9 +122,7 @@ def _get_sinusoidal_embedding(
     """
     assert len(timesteps.shape) == 1
     half_dim = embedding_dim // 2
-    exponent = -math.log(10000) * torch.arange(
-        start=0, end=half_dim, dtype=torch.float32, device=timesteps.device
-    )
+    exponent = -math.log(10000) * torch.arange(start=0, end=half_dim, dtype=torch.float32, device=timesteps.device)
     exponent = exponent / half_dim  # downscale_freq_shift=0
     emb = torch.exp(exponent)
     emb = timesteps.float()[:, None] * emb[None, :]
@@ -166,6 +161,7 @@ class TimestepEmbedding(nn.Module):
 # ---------------------------------------------------------------------------
 # 1D Patch Embedding / Un-embedding (NA-aware via _unflatten/_flatten)
 # ---------------------------------------------------------------------------
+
 
 class PatchIn1D(nn.Module):
     def __init__(self, in_channels: int, patch_size: int, dim: int):
@@ -214,12 +210,12 @@ class PatchOut1D(nn.Module):
 # ---------------------------------------------------------------------------
 
 try:
-    from rotary_embedding_torch import RotaryEmbedding as _RotaryEmbedding, apply_rotary_emb
-except ImportError:
+    from rotary_embedding_torch import RotaryEmbedding as _RotaryEmbedding
+    from rotary_embedding_torch import apply_rotary_emb
+except ImportError as err:
     raise ImportError(
-        "rotary-embedding-torch>=0.8.6 is required. "
-        "Install with: pip install rotary-embedding-torch"
-    )
+        "rotary-embedding-torch>=0.8.6 is required. " "Install with: pip install rotary-embedding-torch"
+    ) from err
 
 
 @lru_cache(maxsize=128)
@@ -285,7 +281,11 @@ class TextRotaryEmbedding(nn.Module):
         txt_freq_list = []
         for i, l in enumerate(txt_shape[:, 0].tolist()):
             txt_freq = _get_axial_freqs(
-                self.rope, (l,), offsets=(offset[i],), repeats=None, flatten=True,
+                self.rope,
+                (l,),
+                offsets=(offset[i],),
+                repeats=None,
+                flatten=True,
             )
             txt_freq_list.append(txt_freq)
         return torch.cat(txt_freq_list, dim=0)
@@ -295,8 +295,9 @@ class TextRotaryEmbedding(nn.Module):
 # Adaptive Layer Norm (AdaLN)
 # ---------------------------------------------------------------------------
 
+
 class AdaLN(nn.Module):
-    def __init__(self, dim: int, emb_dim: int, layers: List[str], modes: List[str] = None):
+    def __init__(self, dim: int, emb_dim: int, layers: list[str], modes: list[str] = None):
         super().__init__()
         if modes is None:
             modes = ["in", "out"]
@@ -339,6 +340,7 @@ class AdaLN(nn.Module):
 # MLP (GELU, tanh approximation)
 # ---------------------------------------------------------------------------
 
+
 class MLP(nn.Module):
     def __init__(self, dim: int, expand_ratio: int, **kwargs):
         super().__init__()
@@ -354,6 +356,7 @@ class MLP(nn.Module):
 # Text Attention (NA: flatten + cu_seqlens)
 # ---------------------------------------------------------------------------
 
+
 class ColaDiTAttention(nn.Module):
     def __init__(self, txt_dim, heads, head_dim, qk_bias, qk_norm_eps, rope_dim):
         super().__init__()
@@ -368,8 +371,8 @@ class ColaDiTAttention(nn.Module):
 
         # Per-sample KV cache. Each entry is a ``(l_i_cum, h, d)`` tensor,
         # one per batch sample. ``None`` means "cache not populated yet".
-        self._k_cache: Optional[List[torch.Tensor]] = None
-        self._v_cache: Optional[List[torch.Tensor]] = None
+        self._k_cache: Optional[list[torch.Tensor]] = None
+        self._v_cache: Optional[list[torch.Tensor]] = None
 
     def set_kv_cache(self, flag: bool) -> None:
         self._k_cache = None
@@ -383,7 +386,7 @@ class ColaDiTAttention(nn.Module):
         d_head = query.shape[-1]
         device_type = "cuda" if query.is_cuda else query.device.type
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            scale = 1.0 / (d_head ** 0.5)
+            scale = 1.0 / (d_head**0.5)
             attn = query.mul(scale) @ key.transpose(-2, -1)
             if attn_mask is not None:
                 attn = attn + attn_mask.to(attn.dtype)
@@ -397,7 +400,7 @@ class ColaDiTAttention(nn.Module):
         self,
         txt: torch.Tensor,
         *,
-        txt_shape: torch.LongTensor,    # (B, 1) K length per sample
+        txt_shape: torch.LongTensor,  # (B, 1) K length per sample
         txt_q_shape: torch.LongTensor,  # (B, 1) Q length per sample
         update_kv: bool = False,
         use_kv_cache: bool = False,
@@ -432,12 +435,8 @@ class ColaDiTAttention(nn.Module):
             full_k = torch.cat(self._k_cache, dim=0)
             full_v = torch.cat(self._v_cache, dim=0)
         elif use_kv_cache and self._k_cache is not None:
-            full_k = torch.cat(
-                [torch.cat([c, n], dim=0) for c, n in zip(self._k_cache, new_ks)], dim=0
-            )
-            full_v = torch.cat(
-                [torch.cat([c, n], dim=0) for c, n in zip(self._v_cache, new_vs)], dim=0
-            )
+            full_k = torch.cat([torch.cat([c, n], dim=0) for c, n in zip(self._k_cache, new_ks)], dim=0)
+            full_v = torch.cat([torch.cat([c, n], dim=0) for c, n in zip(self._v_cache, new_vs)], dim=0)
         else:
             full_k = txt_k
             full_v = txt_v
@@ -468,13 +467,18 @@ class ColaDiTAttention(nn.Module):
 # DiT Transformer Block
 # ---------------------------------------------------------------------------
 
+
 class ColaDiTBlock(nn.Module):
     def __init__(self, txt_dim, emb_dim, heads, head_dim, expand_ratio, norm_eps, qk_bias, rope_dim, block_size):
         super().__init__()
         self.msa_norm = nn.LayerNorm(txt_dim, eps=norm_eps, elementwise_affine=False)
         self.msa = ColaDiTAttention(
-            txt_dim=txt_dim, heads=heads, head_dim=head_dim,
-            qk_bias=qk_bias, qk_norm_eps=norm_eps, rope_dim=rope_dim,
+            txt_dim=txt_dim,
+            heads=heads,
+            head_dim=head_dim,
+            qk_bias=qk_bias,
+            qk_norm_eps=norm_eps,
+            rope_dim=rope_dim,
         )
         self.mlp_norm = nn.LayerNorm(txt_dim, eps=norm_eps, elementwise_affine=False)
         self.mlp = MLP(dim=txt_dim, expand_ratio=expand_ratio)
@@ -518,6 +522,7 @@ class ColaDiTBlock(nn.Module):
 # Output dataclass
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class ColaDiTOutput:
     txt_sample: torch.Tensor
@@ -526,6 +531,7 @@ class ColaDiTOutput:
 # ---------------------------------------------------------------------------
 # Main Model: ColaDiTModel (PreTrainedModel)
 # ---------------------------------------------------------------------------
+
 
 class ColaDiTModel(PreTrainedModel):
     config_class = ColaDiTConfig
@@ -548,25 +554,29 @@ class ColaDiTModel(PreTrainedModel):
             output_dim=config.emb_dim,
         )
 
-        self.blocks = nn.ModuleList([
-            ColaDiTBlock(
-                txt_dim=config.txt_dim,
-                emb_dim=config.emb_dim,
-                heads=config.heads,
-                head_dim=config.head_dim,
-                expand_ratio=config.expand_ratio,
-                norm_eps=config.norm_eps,
-                qk_bias=config.qk_bias,
-                rope_dim=config.rope_dim,
-                block_size=config.block_size,
-            )
-            for _ in range(config.num_layers)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                ColaDiTBlock(
+                    txt_dim=config.txt_dim,
+                    emb_dim=config.emb_dim,
+                    heads=config.heads,
+                    head_dim=config.head_dim,
+                    expand_ratio=config.expand_ratio,
+                    norm_eps=config.norm_eps,
+                    qk_bias=config.qk_bias,
+                    rope_dim=config.rope_dim,
+                    block_size=config.block_size,
+                )
+                for _ in range(config.num_layers)
+            ]
+        )
 
         self.txt_out_norm = nn.LayerNorm(config.txt_dim, eps=config.norm_eps, elementwise_affine=True)
         self.txt_out_ada = AdaLN(
-            dim=config.txt_dim, emb_dim=config.emb_dim,
-            layers=["out"], modes=["in"],
+            dim=config.txt_dim,
+            emb_dim=config.emb_dim,
+            layers=["out"],
+            modes=["in"],
         )
         self.txt_out = PatchOut1D(
             out_channels=config.txt_out_channels,
@@ -663,8 +673,12 @@ class ColaDiTModel(PreTrainedModel):
 
         if self.txt_out_norm is not None:
             txt = self.txt_out_ada(
-                txt, emb=emb, layer="out", mode="in",
-                hid_shape=cpu_txt_shape, norm_layer=self.txt_out_norm,
+                txt,
+                emb=emb,
+                layer="out",
+                mode="in",
+                hid_shape=cpu_txt_shape,
+                norm_layer=self.txt_out_norm,
             )
 
         txt, _ = self.txt_out(txt, txt_shape_patched, txt_shape_before_patchify)

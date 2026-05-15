@@ -52,7 +52,6 @@ from cola_dlm import (
     generate_task_repaint_inference,
 )
 
-
 PROMPTS: list[str] = [
     "Question: What is the capital of France? Answer:",
     "Question: Who painted the Mona Lisa? Answer:",

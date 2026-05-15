@@ -116,8 +116,7 @@ def create_na_block_causal_mask(
     k_lens = _as_flat_long(txt_shape)
     q_lens = _as_flat_long(txt_q_shape)
     assert k_lens.shape == q_lens.shape, (
-        f"txt_shape {txt_shape.shape} and txt_q_shape {txt_q_shape.shape} "
-        "must describe the same batch"
+        f"txt_shape {txt_shape.shape} and txt_q_shape {txt_q_shape.shape} " "must describe the same batch"
     )
     B = int(k_lens.shape[0])
     L_k = int(k_lens.sum().item())
@@ -142,9 +141,7 @@ def create_na_block_causal_mask(
             # Q refers to the LAST ``q_len_b`` positions of K within the
             # same sample — this matches the original padded code where
             # ``txt_q_shape`` always described a suffix of ``txt_shape``.
-            q_local[q_cu[b] : q_cu[b + 1]] = torch.arange(
-                k_len_b - q_len_b, k_len_b, device=device
-            )
+            q_local[q_cu[b] : q_cu[b + 1]] = torch.arange(k_len_b - q_len_b, k_len_b, device=device)
 
     q_block = q_local.unsqueeze(1) // block_size  # (L_q, 1)
     k_block = k_local.unsqueeze(0) // block_size  # (1, L_k)

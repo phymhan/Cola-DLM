@@ -63,23 +63,21 @@ Usage::
 import argparse
 import json
 import os
-from typing import List, Optional
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from tokenizers import Tokenizer
 
-from .configuration_cola_dit import ColaDiTConfig
 from .modeling_cola_dit import ColaDiTModel
-from .configuration_cola_vae import ColaTextVAEConfig
 from .modeling_cola_vae import ColaTextVAEModel
-
 
 # ---------------------------------------------------------------------------
 # Prompt Templates (standalone, from prompt_template.py)
 # ---------------------------------------------------------------------------
 
-def apply_prompt_template(task: str, context: str, question: str, answer: str, choices: Optional[List[str]]) -> str:
+
+def apply_prompt_template(task: str, context: str, question: str, answer: str, choices: Optional[list[str]]) -> str:
     if task == "lambada":
         return question
     elif task == "squad":
@@ -209,6 +207,7 @@ def apply_prompt_template(task: str, context: str, question: str, answer: str, c
 # Sampling Strategies
 # ---------------------------------------------------------------------------
 
+
 def sample_with_strategies(
     logits: torch.Tensor,
     generated_ids: Optional[torch.Tensor] = None,
@@ -271,7 +270,8 @@ def sample_with_strategies(
 # NA helpers (local to inference)
 # ---------------------------------------------------------------------------
 
-def _shape_tensor(lens: List[int], device: torch.device) -> torch.LongTensor:
+
+def _shape_tensor(lens: list[int], device: torch.device) -> torch.LongTensor:
     """Build a ``(B, 1)`` shape tensor from a Python list of per-sample lengths."""
     return torch.tensor([[int(l)] for l in lens], dtype=torch.long, device=device)
 
@@ -280,12 +280,13 @@ def _shape_tensor(lens: List[int], device: torch.device) -> torch.LongTensor:
 # Main Inference Logic — NA form, no batch padding
 # ---------------------------------------------------------------------------
 
+
 @torch.no_grad()
 def generate_task_repaint_inference(
     dit: ColaDiTModel,
     vae: ColaTextVAEModel,
     tokenizer: Tokenizer,
-    prompts: List[dict],
+    prompts: list[dict],
     task_name: str = "lambada",
     device: torch.device = torch.device("cuda"),
     # Diffusion params
@@ -307,7 +308,7 @@ def generate_task_repaint_inference(
     user_token_id: Optional[int] = None,
     assistant_token_id: Optional[int] = None,
     newline_token_id: Optional[int] = None,
-) -> List[dict]:
+) -> list[dict]:
     """End-to-end Cola DLM inference (Eq. 2.2.4–2.2.6 of the paper).
 
     Realizes the three-step inference algorithm of *Continuous Latent
@@ -358,10 +359,10 @@ def generate_task_repaint_inference(
     # -----------------------------------------------------------------
     # Step 1: tokenise + per-sample block-align pad (no batch pad)
     # -----------------------------------------------------------------
-    batch_prompts_text: List[str] = []
-    input_ids_list: List[torch.Tensor] = []
-    token_labels_list: List[torch.Tensor] = []
-    prompt_len_remainders: List[int] = []
+    batch_prompts_text: list[str] = []
+    input_ids_list: list[torch.Tensor] = []
+    token_labels_list: list[torch.Tensor] = []
+    prompt_len_remainders: list[int] = []
 
     chunk = patch_size * block_size
     for item in prompts:
@@ -375,7 +376,10 @@ def generate_task_repaint_inference(
         batch_prompts_text.append(prompt_str)
 
         ids = tokenizer.encode(prompt_str).ids
-        if is_sft and all(tid is not None for tid in [im_start_token_id, user_token_id, assistant_token_id, newline_token_id, im_end_token_id]):
+        if is_sft and all(
+            tid is not None
+            for tid in [im_start_token_id, user_token_id, assistant_token_id, newline_token_id, im_end_token_id]
+        ):
             ids = (
                 [im_start_token_id, user_token_id, newline_token_id]
                 + ids
@@ -408,7 +412,7 @@ def generate_task_repaint_inference(
     # -----------------------------------------------------------------
     # Derivation matches the trainer's ``reshape -> contains_1/contains_2``
     # priority rule: label 1 wins over 2 wins over 3.
-    latent_labels_list: List[torch.Tensor] = []
+    latent_labels_list: list[torch.Tensor] = []
     for t_labels in token_labels_list:
         n_patches = t_labels.shape[0] // patch_size
         reshaped = t_labels.view(n_patches, patch_size)
@@ -421,17 +425,17 @@ def generate_task_repaint_inference(
 
     # Strip trailing label-3 pad: NA form carries only real (label 1/2)
     # latents from this point on.
-    prompt_latent_counts: List[int] = [int((lat == 1).sum().item()) for lat in latent_labels_list]
+    prompt_latent_counts: list[int] = [int((lat == 1).sum().item()) for lat in latent_labels_list]
 
-    prefix_list: List[torch.Tensor] = []
-    first_block_latents_list: List[torch.Tensor] = []
-    first_block_labels_list: List[torch.Tensor] = []
+    prefix_list: list[torch.Tensor] = []
+    first_block_latents_list: list[torch.Tensor] = []
+    first_block_labels_list: list[torch.Tensor] = []
     first_block_prompt_token_counts = torch.zeros(batch_size, dtype=torch.long, device=device)
     force_complete_prefix_only = False
 
     for i in range(batch_size):
         num_ones = prompt_latent_counts[i]
-        lat_total_i = latents_list[i].shape[0]   # total latents *including* label-3 pad tail
+        lat_total_i = latents_list[i].shape[0]  # total latents *including* label-3 pad tail
         # Reference block taken from the original padded implementation:
         # the last ``block_size`` latents of the sample's full (padded)
         # latent sequence. Functions only as a placeholder — the main loop
@@ -455,9 +459,7 @@ def generate_task_repaint_inference(
                 # — used to trim the same tokens off the prediction later.
                 token_start = start_idx * patch_size
                 token_end = min(token_start + block_size * patch_size, token_labels_list[i].shape[0])
-                first_block_prompt_token_counts[i] = (
-                    token_labels_list[i][token_start:token_end] == 1
-                ).sum()
+                first_block_prompt_token_counts[i] = (token_labels_list[i][token_start:token_end] == 1).sum()
                 prefix_list.append(latents_list[i][:start_idx].clone())
                 first_block_latents_list.append(block_latents)
                 first_block_labels_list.append(block_labels)
@@ -522,8 +524,8 @@ def generate_task_repaint_inference(
 
     # Precomputed clean-guidance tensors: ``first_block_*_flatten[i*block_size:(i+1)*block_size]``
     # corresponds to the first generation block of sample ``i``.
-    first_block_latents_flatten = torch.cat(first_block_latents_list, dim=0)   # (B*block_size, d)
-    first_block_labels_flatten = torch.cat(first_block_labels_list, dim=0)     # (B*block_size,)
+    first_block_latents_flatten = torch.cat(first_block_latents_list, dim=0)  # (B*block_size, d)
+    first_block_labels_flatten = torch.cat(first_block_labels_list, dim=0)  # (B*block_size,)
     flat_mask = first_block_labels_flatten == 1
 
     # Per-sample CFG scale for the first generation block. When a sample's
@@ -541,10 +543,15 @@ def generate_task_repaint_inference(
     # when ``guidance_scale`` was a Python scalar); this preserves
     # bitwise alignment with the trainer for samples whose prefix is
     # non-empty and only diverges for short-prompt samples by design.
-    cfg_scale_first_block = torch.tensor(
-        [guidance_scale if pl > 0 else 1.0 for pl in prefix_lens],
-        device=device, dtype=torch.bfloat16,
-    ).repeat_interleave(block_size).unsqueeze(-1)  # (B*block_size, 1)
+    cfg_scale_first_block = (
+        torch.tensor(
+            [guidance_scale if pl > 0 else 1.0 for pl in prefix_lens],
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        .repeat_interleave(block_size)
+        .unsqueeze(-1)
+    )  # (B*block_size, 1)
     _empty_prefix_samples = [i for i, pl in enumerate(prefix_lens) if pl == 0]
     if _empty_prefix_samples:
         print(
@@ -589,17 +596,16 @@ def generate_task_repaint_inference(
                     sid_int = int(sid)
                 except (TypeError, ValueError):
                     import zlib
+
                     sid_int = zlib.crc32(str(sid).encode("utf-8")) & 0xFFFFFFFF
                 g = torch.Generator(device=device)
                 g.manual_seed(base_seed + sid_int * 1_000 + int(step) * 10_000_000)
-                noise_3d[b] = torch.randn(
-                    block_size, latent_dim, device=device, generator=g
-                )
+                noise_3d[b] = torch.randn(block_size, latent_dim, device=device, generator=g)
             txt = noise_3d.view(batch_size * block_size, latent_dim)
         else:
             txt = torch.randn(batch_size * block_size, latent_dim, device=device)
 
-        for i, (t_curr, t_next) in enumerate(zip(timesteps[:-1], timesteps[1:])):
+        for t_curr, t_next in zip(timesteps[:-1], timesteps[1:]):
             ts_batch = torch.full((txt.shape[0],), t_curr, device=device)
             dt = _diffusion_dt(t_curr, t_next)
 
@@ -715,7 +721,7 @@ def generate_task_repaint_inference(
         trimmed_ids.append(context_ids_cpu[sample_idx, trim_count:].tolist())
     generated_texts = tokenizer.decode_batch(trimmed_ids, skip_special_tokens=False)
 
-    results: List[dict] = []
+    results: list[dict] = []
     for idx, gen_text in enumerate(generated_texts):
         entry = {
             "id": prompts[idx].get("id"),
@@ -736,6 +742,7 @@ def generate_task_repaint_inference(
 # CLI entry
 # ---------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(description="Cola Text DiT + VAE Inference (NA form)")
     parser.add_argument("--dit_path", type=str, required=True, help="Path to DiT model directory")
@@ -753,10 +760,15 @@ def main():
     parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling")
     parser.add_argument("--top_p", type=float, default=0.9, help="Top-p sampling")
     parser.add_argument("--pad_token_id", type=int, default=100277, help="Pad token ID")
-    parser.add_argument("--eos_token_id", type=int, default=None,
-                        help="EOS token ID (default: None → stop only on max_new_tokens)")
-    parser.add_argument("--im_end_token_id", type=int, default=None,
-                        help="im_end token ID (default: None → stop only on max_new_tokens)")
+    parser.add_argument(
+        "--eos_token_id", type=int, default=None, help="EOS token ID (default: None → stop only on max_new_tokens)"
+    )
+    parser.add_argument(
+        "--im_end_token_id",
+        type=int,
+        default=None,
+        help="im_end token ID (default: None → stop only on max_new_tokens)",
+    )
     parser.add_argument("--rank", type=int, default=0, help="GPU rank for multi-GPU data-parallel inference")
     parser.add_argument("--world_size", type=int, default=1, help="Total number of GPUs for data-parallel inference")
     args = parser.parse_args()
@@ -773,7 +785,7 @@ def main():
     tokenizer = Tokenizer.from_file(args.tokenizer_path)
 
     raw_data = []
-    with open(args.input_jsonl, "r", encoding="utf-8") as f:
+    with open(args.input_jsonl, encoding="utf-8") as f:
         for line in f:
             if line.strip():
                 raw_data.append(json.loads(line))
@@ -784,10 +796,7 @@ def main():
 
     # Simple stride-based data-parallel sharding across GPUs.
     my_data = raw_data[args.rank :: args.world_size]
-    print(
-        f"[Rank {args.rank}/{args.world_size}] "
-        f"{len(my_data)}/{total} samples for task '{args.task_name}'"
-    )
+    print(f"[Rank {args.rank}/{args.world_size}] " f"{len(my_data)}/{total} samples for task '{args.task_name}'")
 
     os.makedirs(args.output_dir, exist_ok=True)
     if args.world_size > 1:
@@ -804,11 +813,7 @@ def main():
     all_results = []
     for batch_start in range(0, len(my_data), args.batch_size):
         batch_data = my_data[batch_start : batch_start + args.batch_size]
-        print(
-            f"  [Rank {args.rank}] "
-            f"batch {batch_start // args.batch_size + 1} "
-            f"({len(batch_data)} samples)"
-        )
+        print(f"  [Rank {args.rank}] " f"batch {batch_start // args.batch_size + 1} " f"({len(batch_data)} samples)")
         batch_results = generate_task_repaint_inference(
             dit=dit,
             vae=vae,

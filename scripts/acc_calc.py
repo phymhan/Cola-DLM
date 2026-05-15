@@ -12,114 +12,121 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import csv
+import difflib
 import json
 import os
 import re
-import difflib
-import csv
+import shutil
 import sys
 import tempfile
-import shutil
 
 # ==========================================
-# 1. 用户配置区域
+# 1. User configuration
 # ==========================================
 
-# 评测根目录（脚本会在该目录下自动搜索符合标准的子目录）
+# Evaluation root directory. The script searches this directory for standard subdirectories.
 ROOT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "eval_output")
 
-# 符合评测标准的子目录名前缀
+# Prefix for standard evaluation subdirectories.
 EVAL_DIR_PREFIX = "tasks_"
 
-# 是否递归搜索 ROOT_DIR 下的所有层级子目录
+# Whether to search all nested subdirectories under ROOT_DIR recursively.
 RECURSIVE_SEARCH = True
 
-# 是否为每个任务输出 *_correct.jsonl 和 *_wrong.jsonl
+# Whether to write *_correct.jsonl and *_wrong.jsonl for each task.
 WRITE_DETAIL_FILES = True
 
-# 汇总 CSV 输出文件名与路径
+# Summary CSV output file name and path.
 SUMMARY_CSV_NAME = "accuracy_summary.csv"
 SUMMARY_CSV_PATH = os.path.join(ROOT_DIR, SUMMARY_CSV_NAME)
 
-# 任务配置：文件名 -> 合格阈值 (0.0 - 1.0)
+# Task configuration: file name -> pass threshold (0.0 - 1.0).
 # 8 tasks: MMLU, RACE, Story Cloze, LAMBADA, OBQA, HellaSwag, SIQA, SQuAD
-TASK_CONFIG = {    
-    "lambada.jsonl": 1.0,   
+TASK_CONFIG = {
+    "lambada.jsonl": 1.0,
     "mmlu.jsonl": 1.0,
     "obqa.jsonl": 1.0,
-    "hellaswag.jsonl": 1.0,   
+    "hellaswag.jsonl": 1.0,
     "race.jsonl": 1.0,
     "siqa.jsonl": 1.0,
     "squad.jsonl": 1.0,
-    "story_cloze.jsonl": 1.0,  
+    "story_cloze.jsonl": 1.0,
 }
 
-# 默认阈值
+# Default threshold.
 DEFAULT_THRESHOLD = 1.0
 
 # ==========================================
-# 2. 数据预处理功能模块
+# 2. Data preprocessing
 # ==========================================
+
 
 def process_line(data):
     """
-    处理单行JSON数据：
-    将 generate 字段按换行符分割，找到第一个能让前半部分包含实际单词或句子的 \n 进行分割。
+    Process one JSON record.
+
+    Split the ``generate`` field at the first newline whose preceding
+    segment contains an actual word or sentence.
     """
-    if 'generate' in data and isinstance(data['generate'], str):
-        content = data['generate']
+    if "generate" in data and isinstance(data["generate"], str):
+        content = data["generate"]
         split_index = -1
         current_pos = 0
-        
+
         while True:
-            idx = content.find('\n', current_pos)
+            idx = content.find("\n", current_pos)
             if idx == -1:
                 break
-            
+
             part1_candidate = content[:idx]
-            if re.search(r'\w', part1_candidate):
+            if re.search(r"\w", part1_candidate):
                 split_index = idx
                 break
             else:
                 current_pos = idx + 1
-        
+
         if split_index != -1:
             part1 = content[:split_index]
-            part2 = content[split_index + 1:]
-            
-            data['generate'] = part1
-            data['others'] = part2
-            
+            part2 = content[split_index + 1 :]
+
+            data["generate"] = part1
+            data["others"] = part2
+
     return data
+
 
 def reorder_keys(data):
     """
-    对字典的键进行重新排序：前4个(id, prompt, generate, ground_truth)，其余排后。
+    Reorder dictionary keys so id, prompt, generate, and ground_truth come first.
     """
     ordered_data = {}
     priority_keys = ["id", "prompt", "generate", "ground_truth"]
-    
+
     for key in priority_keys:
         if key in data:
             ordered_data[key] = data[key]
-            
+
     for key, value in data.items():
         if key not in priority_keys:
             ordered_data[key] = value
-            
+
     return ordered_data
+
 
 def preprocess_jsonl_file(file_path):
     """
-    预处理单个JSONL文件：提取公共前缀，分割generate，重排键名，原地覆盖保存。
+    Preprocess one JSONL file in place.
+
+    Extract the common prompt prefix, split generate, and reorder keys.
     """
-    print(f"  -> [预处理] 开始清洗文件: {os.path.basename(file_path)}")
+    print(f"  -> [preprocess] Cleaning file: {os.path.basename(file_path)}")
     all_lines_data = []
     prompts = []
-    
+
     try:
-        with open(file_path, 'r', encoding='utf-8') as source_file:
-            for line_num, line in enumerate(source_file):
+        with open(file_path, encoding="utf-8") as source_file:
+            for _line_num, line in enumerate(source_file):
                 line = line.strip()
                 if not line:
                     continue
@@ -127,13 +134,13 @@ def preprocess_jsonl_file(file_path):
                     data = json.loads(line)
                     processed_data = process_line(data)
                     all_lines_data.append(processed_data)
-                    
-                    if 'prompt' in processed_data and isinstance(processed_data['prompt'], str):
-                        prompts.append(processed_data['prompt'])
+
+                    if "prompt" in processed_data and isinstance(processed_data["prompt"], str):
+                        prompts.append(processed_data["prompt"])
                 except json.JSONDecodeError:
                     pass
     except Exception as e:
-        print(f"    [错误] 读取文件 {file_path} 出错: {e}")
+        print(f"    [error] Failed to read file {file_path}: {e}")
         return
 
     if not all_lines_data:
@@ -142,103 +149,133 @@ def preprocess_jsonl_file(file_path):
     common_prefix = ""
     if prompts:
         common_prefix = os.path.commonprefix(prompts)
-    
+
     if common_prefix:
-        preview = common_prefix[:40].replace('\n', '\\n') + "..."
-        print(f"    -> [预处理] 提取到 few-shot 前缀 (长度:{len(common_prefix)}) | 预览: {preview}")
+        preview = common_prefix[:40].replace("\n", "\\n") + "..."
+        print(f"    -> [preprocess] Detected few-shot prefix (length: {len(common_prefix)}) | preview: {preview}")
 
     temp_fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(file_path), text=True)
     try:
-        with os.fdopen(temp_fd, 'w', encoding='utf-8') as temp_file:
+        with os.fdopen(temp_fd, "w", encoding="utf-8") as temp_file:
             for data in all_lines_data:
-                if common_prefix and 'prompt' in data and data['prompt'].startswith(common_prefix):
-                    data['few_shot_prefix'] = common_prefix
-                    data['prompt'] = data['prompt'][len(common_prefix):]
-                
+                if common_prefix and "prompt" in data and data["prompt"].startswith(common_prefix):
+                    data["few_shot_prefix"] = common_prefix
+                    data["prompt"] = data["prompt"][len(common_prefix) :]
+
                 final_data = reorder_keys(data)
-                temp_file.write(json.dumps(final_data, ensure_ascii=False) + '\n')
-        
+                temp_file.write(json.dumps(final_data, ensure_ascii=False) + "\n")
+
         shutil.move(temp_path, file_path)
-        print(f"    -> [预处理] 清洗完成，已覆写原文件")
+        print("    -> [preprocess] Cleaning complete; original file overwritten")
     except Exception as e:
-        print(f"    [错误] 写入临时文件出错: {e}")
+        print(f"    [error] Failed to write temporary file: {e}")
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
+
 # ==========================================
-# 3. 评测打分工具函数
+# 3. Evaluation scoring helpers
 # ==========================================
 
+
 def normalize_text(text):
-    if text is None: return ""
+    if text is None:
+        return ""
     text = str(text).lower().strip()
-    text = re.sub(r'[^\w\s]', '', text)
+    text = re.sub(r"[^\w\s]", "", text)
     text = " ".join(text.split())
     return text
+
 
 def calculate_similarity(text1, text2):
     norm_t1 = normalize_text(text1)
     norm_t2 = normalize_text(text2)
-    if not norm_t1 and not norm_t2: return 1.0
+    if not norm_t1 and not norm_t2:
+        return 1.0
     matcher = difflib.SequenceMatcher(None, norm_t1, norm_t2)
     return matcher.ratio()
+
 
 def get_first_word(text):
     norm_text = normalize_text(text)
     parts = norm_text.split()
-    if parts: return parts[0]
+    if parts:
+        return parts[0]
     return ""
 
+
 def extract_answer_segment(text):
-    if text is None: return ""
+    if text is None:
+        return ""
     raw = str(text).strip()
-    if not raw: return ""
+    if not raw:
+        return ""
     lines = [line.strip() for line in raw.splitlines() if line.strip()]
     for line in reversed(lines):
-        m = re.search(r'(?i)\b(?:final\s+answer|answer)\b\s*(?:is|=|:|：)?\s*(.+)$', line)
-        if m and m.group(1).strip(): return m.group(1).strip()
+        m = re.search(r"(?i)\b(?:final\s+answer|answer)\b\s*(?:is|=|:|：)?\s*(.+)$", line)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
     return raw
 
+
 def extract_choice_letter(text, max_choices=26):
-    if text is None: return ""
+    if text is None:
+        return ""
     raw = str(text).strip()
-    if not raw: return ""
-    
-    m = re.fullmatch(r'[\(\[]?\s*([A-Za-z])\s*[\)\]]?\.?', raw)
+    if not raw:
+        return ""
+
+    m = re.fullmatch(r"[\(\[]?\s*([A-Za-z])\s*[\)\]]?\.?", raw)
     if m:
         letter = m.group(1).upper()
-        if 0 <= (ord(letter) - 65) < max_choices: return letter
+        if 0 <= (ord(letter) - 65) < max_choices:
+            return letter
 
-    keyword_pattern = re.compile(r'(?i)\b(?:final\s+answer|answer|option|choice)\b\s*(?:is|=|:|：)?\s*[\(\[]?\s*([A-Za-z])\s*[\)\]]?(?=\s|$|[.,;:!?])')
+    keyword_pattern = re.compile(
+        r"(?i)\b(?:final\s+answer|answer|option|choice)\b\s*(?:is|=|:|：)?\s*[\(\[]?\s*([A-Za-z])\s*[\)\]]?(?=\s|$|[.,;:!?])"
+    )
     matches = keyword_pattern.findall(raw)
     if matches:
         letter = matches[-1].upper()
-        if 0 <= (ord(letter) - 65) < max_choices: return letter
+        if 0 <= (ord(letter) - 65) < max_choices:
+            return letter
 
     if len(raw) <= 40:
-        bracket_matches = re.findall(r'[\(\[]\s*([A-Za-z])\s*[\)\]]', raw)
+        bracket_matches = re.findall(r"[\(\[]\s*([A-Za-z])\s*[\)\]]", raw)
         if bracket_matches:
             letter = bracket_matches[-1].upper()
-            if 0 <= (ord(letter) - 65) < max_choices: return letter
+            if 0 <= (ord(letter) - 65) < max_choices:
+                return letter
     return ""
 
+
 def match_choice_by_text(text, choices):
-    if text is None or not choices: return ""
+    if text is None or not choices:
+        return ""
     norm_text = normalize_text(text)
-    if not norm_text: return ""
+    if not norm_text:
+        return ""
 
     for i, choice in enumerate(choices):
-        if normalize_text(choice) == norm_text: return chr(65 + i)
+        if normalize_text(choice) == norm_text:
+            return chr(65 + i)
 
-    cleaned = re.sub(r'(?i)^(the\s+)?(correct\s+)?(final\s+)?(answer|option|choice)\b\s*(is|=|:|：)?\s*', '', str(text)).strip()
+    cleaned = re.sub(
+        r"(?i)^(the\s+)?(correct\s+)?(final\s+)?(answer|option|choice)\b\s*(is|=|:|：)?\s*", "", str(text)
+    ).strip()
     norm_cleaned = normalize_text(cleaned)
-    if not norm_cleaned: return ""
+    if not norm_cleaned:
+        return ""
 
     for i, choice in enumerate(choices):
-        if normalize_text(choice) == norm_cleaned: return chr(65 + i)
+        if normalize_text(choice) == norm_cleaned:
+            return chr(65 + i)
 
-    contained = [i for i, choice in enumerate(choices) if normalize_text(choice) and normalize_text(choice) in norm_cleaned]
-    if len(contained) == 1: return chr(65 + contained[0])
+    contained = [
+        i for i, choice in enumerate(choices) if normalize_text(choice) and normalize_text(choice) in norm_cleaned
+    ]
+    if len(contained) == 1:
+        return chr(65 + contained[0])
 
     best_idx, best_score = -1, 0.0
     for i, choice in enumerate(choices):
@@ -246,30 +283,40 @@ def match_choice_by_text(text, choices):
         if score > best_score:
             best_idx = i
             best_score = score
-    if best_idx >= 0 and best_score >= 0.9: return chr(65 + best_idx)
+    if best_idx >= 0 and best_score >= 0.9:
+        return chr(65 + best_idx)
     return ""
+
 
 def extract_mmlu_choice_letter(text, choices):
     max_choices = min(len(choices), 26)
-    if max_choices == 0: return ""
+    if max_choices == 0:
+        return ""
     answer_segment = extract_answer_segment(text)
     for candidate in [answer_segment, text]:
         letter = extract_choice_letter(candidate, max_choices=max_choices)
-        if letter: return letter
+        if letter:
+            return letter
         letter = match_choice_by_text(candidate, choices)
-        if letter: return letter
+        if letter:
+            return letter
     return ""
+
 
 def extract_gt_mmlu_choice_letter(gt_text, choices):
     max_choices = min(len(choices), 26)
-    if max_choices == 0: return ""
+    if max_choices == 0:
+        return ""
     letter = extract_choice_letter(gt_text, max_choices=max_choices)
-    if letter: return letter
+    if letter:
+        return letter
     return match_choice_by_text(gt_text, choices)
 
+
 # ==========================================
-# 4. 核心文件处理逻辑 (预处理 + 评测)
+# 4. Core file processing (preprocessing + evaluation)
 # ==========================================
+
 
 def process_single_file(file_path, threshold, write_detail_files=True):
     filename = os.path.basename(file_path)
@@ -278,10 +325,10 @@ def process_single_file(file_path, threshold, write_detail_files=True):
 
     path_correct = os.path.join(dir_name, f"{file_stem}_correct.jsonl")
     path_wrong = os.path.join(dir_name, f"{file_stem}_wrong.jsonl")
-    
+
     preprocess_jsonl_file(file_path)
-    
-    print(f"  -> [评测] 正在打分: {filename} | 阈值: {threshold}")
+
+    print(f"  -> [evaluate] Scoring: {filename} | threshold: {threshold}")
 
     stats = {"total": 0, "correct": 0, "wrong": 0, "accuracy": None}
     remainder_buckets = {}
@@ -289,29 +336,30 @@ def process_single_file(file_path, threshold, write_detail_files=True):
     id_to_remainder = {}
     f_cor = None
     f_err = None
-    
+
     try:
-        with open(file_path, 'r', encoding='utf-8') as f_in:
+        with open(file_path, encoding="utf-8") as f_in:
             if write_detail_files:
-                f_cor = open(path_correct, 'w', encoding='utf-8')
-                f_err = open(path_wrong, 'w', encoding='utf-8')
-            
+                f_cor = open(path_correct, "w", encoding="utf-8")
+                f_err = open(path_wrong, "w", encoding="utf-8")
+
             for line_idx, line in enumerate(f_in, 1):
                 line = line.strip()
-                if not line: continue
-                
+                if not line:
+                    continue
+
                 try:
                     data = json.loads(line)
                     gen = data.get("generate", "")
                     gt = data.get("ground_truth", data.get("answer", ""))
-                    
+
                     if filename == "lambada.jsonl":
                         word_gen = get_first_word(gen)
                         word_gt = get_first_word(gt)
                         score = 1.0 if word_gen == word_gt else 0.0
-                        data['extracted_gen_word'] = word_gen
-                        data['extracted_gt_word'] = word_gt
-                        
+                        data["extracted_gen_word"] = word_gen
+                        data["extracted_gt_word"] = word_gt
+
                     elif filename in ["mmlu.jsonl", "obqa.jsonl", "race.jsonl", "siqa.jsonl"]:
                         choices = data.get("choices", [])
                         pred_choice = extract_mmlu_choice_letter(gen, choices)
@@ -322,17 +370,17 @@ def process_single_file(file_path, threshold, write_detail_files=True):
                         else:
                             sim_score = calculate_similarity(gen, gt)
                             score = 1.0 if sim_score >= threshold else sim_score
-                            
-                        data['extracted_gen_choice'] = pred_choice
-                        data['extracted_gt_choice'] = gt_choice
+
+                        data["extracted_gen_choice"] = pred_choice
+                        data["extracted_gt_choice"] = gt_choice
 
                     else:
                         score = calculate_similarity(gen, gt)
-                    
-                    data['similarity_score'] = round(score, 4)
+
+                    data["similarity_score"] = round(score, 4)
                     is_correct = score >= threshold
                     stats["total"] += 1
-                    
+
                     if is_correct:
                         stats["correct"] += 1
                         if write_detail_files and f_cor is not None:
@@ -363,14 +411,14 @@ def process_single_file(file_path, threshold, write_detail_files=True):
                 except json.JSONDecodeError:
                     pass
                 except Exception as e:
-                    print(f"  [错误] 第 {line_idx} 行出错: {e}")
+                    print(f"  [error] Failed to process line {line_idx}: {e}")
 
         if stats["total"] > 0:
             acc = (stats["correct"] / stats["total"]) * 100
             stats["accuracy"] = acc
-            print(f"  -> 结果: 准确率 {acc:.2f}% (对 {stats['correct']} / 错 {stats['wrong']})")
+            print(f"  -> result: accuracy {acc:.2f}% (correct {stats['correct']} / wrong {stats['wrong']})")
         else:
-            print("  -> 无有效数据")
+            print("  -> no valid data")
 
         remainder_stats = {}
         if remainder_buckets:
@@ -384,13 +432,14 @@ def process_single_file(file_path, threshold, write_detail_files=True):
                         "wrong": bucket["wrong"],
                         "accuracy": r_acc,
                     }
-                    print(f"    -> mod={r}: 准确率 {r_acc:.2f}% (对 {bucket['correct']} / 总 {bucket['total']})")
+                    print(
+                        f"    -> mod={r}: accuracy {r_acc:.2f}% (correct {bucket['correct']} / total {bucket['total']})"
+                    )
 
                 if write_detail_files:
                     cor_path = os.path.join(dir_name, f"{file_stem}_mod{r}_correct.jsonl")
                     err_path = os.path.join(dir_name, f"{file_stem}_mod{r}_wrong.jsonl")
-                    with open(cor_path, 'w', encoding='utf-8') as fc, \
-                         open(err_path, 'w', encoding='utf-8') as fe:
+                    with open(cor_path, "w", encoding="utf-8") as fc, open(err_path, "w", encoding="utf-8") as fe:
                         for rec in bucket["records"]:
                             if rec.get("similarity_score", 0) >= threshold:
                                 fc.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -398,61 +447,73 @@ def process_single_file(file_path, threshold, write_detail_files=True):
                                 fe.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     except FileNotFoundError:
-        print(f"  [错误] 找不到文件: {file_path}")
+        print(f"  [error] File not found: {file_path}")
     finally:
-        if f_cor is not None: f_cor.close()
-        if f_err is not None: f_err.close()
-    
+        if f_cor is not None:
+            f_cor.close()
+        if f_err is not None:
+            f_err.close()
+
     print("-" * 50)
     return stats, remainder_stats, id_to_correct, id_to_remainder
 
+
 # ==========================================
-# 5. 批处理与主入口
+# 5. Batch processing and main entry point
 # ==========================================
+
 
 def extract_run_alias(dir_path):
     dir_name = os.path.basename(os.path.normpath(dir_path))
     if dir_name.startswith(EVAL_DIR_PREFIX):
-        alias = dir_name[len(EVAL_DIR_PREFIX):].strip()
+        alias = dir_name[len(EVAL_DIR_PREFIX) :].strip()
         return alias if alias else dir_name
     return dir_name
 
+
 def make_unique_alias(alias, used_aliases):
-    if alias not in used_aliases: return alias
+    if alias not in used_aliases:
+        return alias
     idx = 2
-    while f"{alias}_{idx}" in used_aliases: idx += 1
+    while f"{alias}_{idx}" in used_aliases:
+        idx += 1
     return f"{alias}_{idx}"
+
 
 def find_eval_dirs(root_dir):
     found = []
     seen = set()
     walker = os.walk(root_dir) if RECURSIVE_SEARCH else [(root_dir, *next(os.walk(root_dir))[1:])]
-    
+
     for current_root, _, files in walker:
         dir_name = os.path.basename(os.path.normpath(current_root))
-        if not dir_name.startswith(EVAL_DIR_PREFIX): continue
-        if not [task for task in TASK_CONFIG if task in files]: continue
+        if not dir_name.startswith(EVAL_DIR_PREFIX):
+            continue
+        if not [task for task in TASK_CONFIG if task in files]:
+            continue
 
         norm_root = os.path.normpath(current_root)
-        if norm_root in seen: continue
+        if norm_root in seen:
+            continue
         seen.add(norm_root)
         found.append(norm_root)
 
     found.sort()
     return found
 
+
 def evaluate_single_directory(eval_dir):
-    print(f"\n评测目录: {eval_dir}")
+    print(f"\nEvaluation directory: {eval_dir}")
     print("=" * 50)
     task_acc_map = {}
     task_remainder_map = {}
     task_id_correct_map = {}
     task_id_remainder_map = {}
-    
+
     for task_file in TASK_CONFIG:
         file_path = os.path.join(eval_dir, task_file)
         if not os.path.isfile(file_path):
-            print(f"跳过: {task_file} (文件不存在)\n" + "-" * 50)
+            print(f"Skipping: {task_file} (file does not exist)\n" + "-" * 50)
             task_acc_map[task_file] = None
             continue
 
@@ -469,6 +530,7 @@ def evaluate_single_directory(eval_dir):
             task_id_remainder_map[task_file] = id_to_remainder
 
     return task_acc_map, task_remainder_map, task_id_correct_map, task_id_remainder_map
+
 
 def write_summary_csv(summary_csv_path, results_by_alias, remainder_by_alias):
     aliases = list(results_by_alias.keys())
@@ -506,9 +568,7 @@ def write_summary_csv(summary_csv_path, results_by_alias, remainder_by_alias):
         avg_values = {}
         for alias in aliases:
             accs = [
-                results_by_alias[alias].get(task)
-                for task in tasks
-                if results_by_alias[alias].get(task) is not None
+                results_by_alias[alias].get(task) for task in tasks if results_by_alias[alias].get(task) is not None
             ]
             if accs:
                 avg = sum(accs) / len(accs)
@@ -519,7 +579,7 @@ def write_summary_csv(summary_csv_path, results_by_alias, remainder_by_alias):
                 avg_row.append("")
         writer.writerow(avg_row)
 
-    print("\n各 alias 的任务平均准确率:")
+    print("\nAverage task accuracy by alias:")
     for alias in aliases:
         avg = avg_values.get(alias)
         if avg is None:
@@ -527,26 +587,30 @@ def write_summary_csv(summary_csv_path, results_by_alias, remainder_by_alias):
         else:
             print(f"  {alias}: {avg:.2f}%")
 
+
 def main():
     global ROOT_DIR, SUMMARY_CSV_PATH
 
-    if len(sys.argv) >= 2 and sys.argv[1].strip(): ROOT_DIR = sys.argv[1].strip()
-    if len(sys.argv) >= 3 and sys.argv[2].strip(): SUMMARY_CSV_PATH = sys.argv[2].strip()
-    else: SUMMARY_CSV_PATH = os.path.join(ROOT_DIR, SUMMARY_CSV_NAME)
+    if len(sys.argv) >= 2 and sys.argv[1].strip():
+        ROOT_DIR = sys.argv[1].strip()
+    if len(sys.argv) >= 3 and sys.argv[2].strip():
+        SUMMARY_CSV_PATH = sys.argv[2].strip()
+    else:
+        SUMMARY_CSV_PATH = os.path.join(ROOT_DIR, SUMMARY_CSV_NAME)
 
     if not os.path.exists(ROOT_DIR):
-        print(f"错误: 目录 {ROOT_DIR} 不存在")
+        print(f"Error: directory {ROOT_DIR} does not exist")
         return
 
     eval_dirs = find_eval_dirs(ROOT_DIR)
     if not eval_dirs:
-        print(f"未在 {ROOT_DIR} 下找到符合标准的评测子目录。")
+        print(f"No standard evaluation subdirectories found under {ROOT_DIR}.")
         return
 
-    print("开始批量预处理与评测...\n" + "=" * 50)
-    print(f"搜索根目录: {ROOT_DIR}")
-    print(f"发现候选目录数: {len(eval_dirs)}")
-    
+    print("Starting batch preprocessing and evaluation...\n" + "=" * 50)
+    print(f"Search root directory: {ROOT_DIR}")
+    print(f"Candidate directories found: {len(eval_dirs)}")
+
     used_aliases = set()
     aliases_ordered = []
     results_by_alias = {}
@@ -559,7 +623,7 @@ def main():
         alias = make_unique_alias(raw_alias, used_aliases)
         used_aliases.add(alias)
         aliases_ordered.append(alias)
-        
+
         task_acc_map, task_remainder_map, task_id_correct, task_id_remainder = evaluate_single_directory(eval_dir)
         results_by_alias[alias] = task_acc_map
         if task_remainder_map:
@@ -606,8 +670,10 @@ def main():
                         "wrong": bucket["wrong"],
                         "accuracy": r_acc,
                     }
-                    print(f"  [交叉关联] {alias} | {task} | mod={rem}: "
-                          f"准确率 {r_acc:.2f}% (对 {bucket['correct']} / 总 {bucket['total']})")
+                    print(
+                        f"  [cross-reference] {alias} | {task} | mod={rem}: "
+                        f"accuracy {r_acc:.2f}% (correct {bucket['correct']} / total {bucket['total']})"
+                    )
             if r_stats:
                 if alias not in remainder_by_alias:
                     remainder_by_alias[alias] = {}
@@ -615,7 +681,8 @@ def main():
 
     os.makedirs(os.path.dirname(SUMMARY_CSV_PATH) or ".", exist_ok=True)
     write_summary_csv(SUMMARY_CSV_PATH, results_by_alias, remainder_by_alias)
-    print(f"\n汇总完成! CSV 已保存至: {SUMMARY_CSV_PATH}")
+    print(f"\nSummary complete! CSV saved to: {SUMMARY_CSV_PATH}")
+
 
 if __name__ == "__main__":
     main()

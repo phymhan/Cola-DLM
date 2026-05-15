@@ -42,6 +42,7 @@ dependencies = [
     "tokenizers>=0.15",
     "einops>=0.7",
     "numpy>=1.24",
+    "rotary-embedding-torch>=0.8.6",
     "safetensors>=0.4",
 ]
 
