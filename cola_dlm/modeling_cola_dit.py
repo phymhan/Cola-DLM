@@ -270,6 +270,17 @@ class TextRotaryEmbedding(nn.Module):
         txt_k = rearrange(txt_k, "h L d -> L h d")
         return txt_q, txt_k
 
+    def get_freqs_from_positions(self, position_ids: torch.Tensor) -> torch.Tensor:
+        """Build RoPE frequencies from explicit integer position IDs.
+
+        ``position_ids`` is a 1-D ``(L,)`` long tensor of per-token
+        positions — e.g. ``[0, 1, ..., L-1, 0, 1, ..., L-1]`` for the
+        2L training trick where clean and noisy copies share positions.
+        """
+        pos = position_ids.float().to(self.rope.device)
+        freqs = self.rope.forward(pos, seq_len=pos.shape[0], offset=0)
+        return freqs
+
     def get_freqs(self, txt_shape, offset=None):
         """Concat per-sample RoPE frequencies along the flattened sequence.
 
@@ -406,6 +417,8 @@ class ColaDiTAttention(nn.Module):
         use_kv_cache: bool = False,
         attn_block_mask: Optional[torch.Tensor] = None,
         block_size: Optional[int] = None,
+        k_position_ids: Optional[torch.Tensor] = None,
+        q_position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # ``txt`` is ``(L_q_total, d)`` — per-sample Q blocks already concatenated.
         txt_qkv = self.proj_qkv(txt)
@@ -418,10 +431,6 @@ class ColaDiTAttention(nn.Module):
         q_lens = txt_q_shape.flatten().tolist()
 
         # -- KV cache bookkeeping -------------------------------------------------
-        # The cache stores per-sample concatenated K/V. ``update_kv=True``
-        # *appends* the current Q/K/V to the cache; ``use_kv_cache=True``
-        # reads it. ``update_kv`` implies a read after the append, matching
-        # the original batched implementation.
         new_ks = list(txt_k.split(q_lens))
         new_vs = list(txt_v.split(q_lens))
 
@@ -442,15 +451,14 @@ class ColaDiTAttention(nn.Module):
             full_v = txt_v
 
         # -- RoPE -----------------------------------------------------------------
-        # NA form: every sample's K/V has already been stripped of pad slots
-        # before flattening, so RoPE uses canonical per-sample positions
-        # ``k_offset = 0`` and ``q_offset = txt_shape - txt_q_shape``
-        # (Q aligned to the tail of K). On the NA layout there is no
-        # ``rope_pad_offset`` to worry about — every position is real.
-        k_offset = [0] * txt_shape.shape[0]
-        q_offset = (txt_shape - txt_q_shape).flatten().int().tolist()
-        freqs_k = self.rope.get_freqs(txt_shape, offset=k_offset)
-        freqs_q = self.rope.get_freqs(txt_q_shape, offset=q_offset)
+        if k_position_ids is not None and q_position_ids is not None:
+            freqs_k = self.rope.get_freqs_from_positions(k_position_ids)
+            freqs_q = self.rope.get_freqs_from_positions(q_position_ids)
+        else:
+            k_offset = [0] * txt_shape.shape[0]
+            q_offset = (txt_shape - txt_q_shape).flatten().int().tolist()
+            freqs_k = self.rope.get_freqs(txt_shape, offset=k_offset)
+            freqs_q = self.rope.get_freqs(txt_q_shape, offset=q_offset)
         txt_q, full_k = self.rope.apply_freqs(txt_q, full_k, freqs_q=freqs_q, freqs_k=freqs_k)
 
         # -- Attention ------------------------------------------------------------
@@ -495,6 +503,8 @@ class ColaDiTBlock(nn.Module):
         use_kv_cache=False,
         attn_block_mask=None,
         cpu_txt_shape=None,
+        k_position_ids=None,
+        q_position_ids=None,
     ):
         ada_kwargs = {"hid_shape": cpu_txt_shape if cpu_txt_shape is not None else txt_q_shape}
 
@@ -506,6 +516,8 @@ class ColaDiTBlock(nn.Module):
             update_kv=update_kv,
             use_kv_cache=use_kv_cache,
             attn_block_mask=attn_block_mask,
+            k_position_ids=k_position_ids,
+            q_position_ids=q_position_ids,
         )
         txt = self.ada(txt_msa, emb=emb, layer="msa", mode="out", residual=txt, **ada_kwargs)
 
@@ -599,6 +611,9 @@ class ColaDiTModel(PreTrainedModel):
         timestep: Union[int, float, torch.IntTensor, torch.FloatTensor],
         update_kv: bool = False,
         use_kv_cache: bool = False,
+        k_position_ids: Optional[torch.Tensor] = None,
+        q_position_ids: Optional[torch.Tensor] = None,
+        attn_mask_override: Optional[torch.Tensor] = None,
     ) -> ColaDiTOutput:
         """NA-form forward pass — one prior-transport step on block ``b``.
 
@@ -628,11 +643,18 @@ class ColaDiTModel(PreTrainedModel):
                                 is also True the append happens first,
                                 then the read.
 
-        NA form has NO ``rope_pad_offset`` argument: every sample's K/Q
-        has pad slots stripped before flattening, so ``k_offset = 0``
-        and ``q_offset = txt_shape - txt_q_shape`` is the correct RoPE
-        indexing — i.e. the same flattened layout the original trainer
-        operated on.
+        * ``k_position_ids`` : ``(L_k_total,)`` optional explicit RoPE
+                                positions for K. Used by the 2L training
+                                trick to give clean and noisy copies
+                                shared positions.
+        * ``q_position_ids`` : ``(L_q_total,)`` optional explicit RoPE
+                                positions for Q. Must be provided together
+                                with ``k_position_ids``.
+
+        When ``k_position_ids`` and ``q_position_ids`` are both ``None``
+        (the default), RoPE uses ``k_offset = 0`` and
+        ``q_offset = txt_shape - txt_q_shape`` — i.e. the same canonical
+        NA layout as the original trainer and inference code.
         """
         txt, txt_shape_patched, txt_shape_before_patchify = self.txt_in(txt, txt_shape)
 
@@ -649,13 +671,16 @@ class ColaDiTModel(PreTrainedModel):
         emb = self.emb_in(timestep, device=txt.device, dtype=txt.dtype)
 
         # Build NA attention mask once per forward — identical for every block.
-        attn_mask = create_na_block_causal_mask(
-            txt_shape=txt_shape_patched,
-            txt_q_shape=txt_q_shape,
-            block_size=self.block_size,
-            dtype=torch.bfloat16 if txt.is_cuda else txt.dtype,
-            device=txt.device,
-        )
+        if attn_mask_override is not None:
+            attn_mask = attn_mask_override
+        else:
+            attn_mask = create_na_block_causal_mask(
+                txt_shape=txt_shape_patched,
+                txt_q_shape=txt_q_shape,
+                block_size=self.block_size,
+                dtype=torch.bfloat16 if txt.is_cuda else txt.dtype,
+                device=txt.device,
+            )
 
         cpu_txt_shape = txt_q_shape.cpu()
 
@@ -669,6 +694,8 @@ class ColaDiTModel(PreTrainedModel):
                 use_kv_cache=use_kv_cache,
                 attn_block_mask=attn_mask,
                 cpu_txt_shape=cpu_txt_shape,
+                k_position_ids=k_position_ids,
+                q_position_ids=q_position_ids,
             )
 
         if self.txt_out_norm is not None:

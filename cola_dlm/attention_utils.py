@@ -156,3 +156,109 @@ def create_na_block_causal_mask(
     mask = torch.full((L_q, L_k), min_val, dtype=dtype, device=device)
     mask.masked_fill_(allowed, 0.0 if dtype.is_floating_point else 0)
     return mask.unsqueeze(0).unsqueeze(0)  # (1, 1, L_q, L_k)
+
+
+def create_2l_block_causal_mask(
+    txt_shape: torch.LongTensor,
+    txt_q_shape: torch.LongTensor,
+    seq_lens: list[int],
+    block_size,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Attention mask for the 2L training trick.
+
+    Each sample has layout ``[clean(L) | noisy(L)]``.  Q may cover the
+    full ``2L`` (when ``txt_q_shape == txt_shape``) or only the noisy
+    tail ``L`` (when ``txt_q_shape[i] == seq_lens[i]``).  The mask
+    enforces, for **noisy** Q positions:
+
+    * Noisy Q at sequence block ``b`` can attend to clean K blocks
+      ``0 .. b-1`` (strict causal — clean block ``b`` excluded).
+    * Noisy Q at block ``b`` can attend to its own noisy K block ``b``
+      (bidirectional within block).
+    * No attention to other noisy K blocks.
+
+    For **clean** Q positions (only present when ``txt_q_shape == 2L``):
+
+    * Standard block-causal over the clean copy.
+    * No attention to the noisy copy.
+
+    Parameters
+    ----------
+    txt_shape : (B, 1)
+        Per-sample K length, equal to ``2 * seq_lens[i]``.
+    txt_q_shape : (B, 1)
+        Per-sample Q length — either ``2 * seq_lens[i]`` or ``seq_lens[i]``.
+    seq_lens : list[int]
+        Per-sample original (single-copy) sequence length ``L``.
+    block_size : int or list[int]
+        Block size for block-causal attention. If list, per-sample block sizes.
+    dtype, device
+
+    Returns
+    -------
+    (1, 1, L_q_total, L_k_total) additive mask.
+    """
+    k_lens = _as_flat_long(txt_shape)
+    q_lens = _as_flat_long(txt_q_shape)
+    B = int(k_lens.shape[0])
+    L_k = int(k_lens.sum().item())
+    L_q = int(q_lens.sum().item())
+
+    if isinstance(block_size, int):
+        block_sizes = [block_size] * B
+    else:
+        block_sizes = list(block_size)
+
+    k_cu = F.pad(k_lens.cumsum(0), (1, 0))
+    q_cu = F.pad(q_lens.cumsum(0), (1, 0))
+
+    k_sample = torch.zeros(L_k, dtype=torch.long, device=device)
+    k_block_idx = torch.zeros(L_k, dtype=torch.long, device=device)
+    k_is_clean = torch.zeros(L_k, dtype=torch.bool, device=device)
+    q_sample = torch.zeros(L_q, dtype=torch.long, device=device)
+    q_block_idx = torch.zeros(L_q, dtype=torch.long, device=device)
+    q_is_clean = torch.zeros(L_q, dtype=torch.bool, device=device)
+
+    for b in range(B):
+        L_i = seq_lens[b]
+        bs_i = block_sizes[b]
+        q_len_b = int(q_lens[b].item())
+
+        k_sample[k_cu[b] : k_cu[b + 1]] = b
+        k_local = torch.arange(L_i, device=device)
+        k_block_idx[k_cu[b] : k_cu[b] + L_i] = k_local // bs_i
+        k_block_idx[k_cu[b] + L_i : k_cu[b + 1]] = k_local // bs_i
+        k_is_clean[k_cu[b] : k_cu[b] + L_i] = True
+
+        q_sample[q_cu[b] : q_cu[b + 1]] = b
+        if q_len_b == 2 * L_i:
+            q_local = torch.arange(L_i, device=device)
+            q_block_idx[q_cu[b] : q_cu[b] + L_i] = q_local // bs_i
+            q_block_idx[q_cu[b] + L_i : q_cu[b + 1]] = q_local // bs_i
+            q_is_clean[q_cu[b] : q_cu[b] + L_i] = True
+        else:
+            q_local = torch.arange(q_len_b, device=device)
+            q_block_idx[q_cu[b] : q_cu[b + 1]] = q_local // bs_i
+
+    q_blk = q_block_idx.unsqueeze(1)  # (L_q, 1)
+    k_blk = k_block_idx.unsqueeze(0)  # (1, L_k)
+    same_sample = q_sample.unsqueeze(1) == k_sample.unsqueeze(0)
+
+    k_clean = k_is_clean.unsqueeze(0)
+    q_clean = q_is_clean.unsqueeze(1)
+
+    noisy_q_clean_k = (~q_clean) & k_clean & (q_blk > k_blk)
+    noisy_q_noisy_k = (~q_clean) & (~k_clean) & (q_blk == k_blk)
+    clean_q_clean_k = q_clean & k_clean & (q_blk >= k_blk)
+
+    allowed = same_sample & (noisy_q_clean_k | noisy_q_noisy_k | clean_q_clean_k)
+
+    if dtype.is_floating_point:
+        min_val = torch.finfo(dtype).min
+    else:
+        min_val = torch.iinfo(dtype).min
+    mask = torch.full((L_q, L_k), min_val, dtype=dtype, device=device)
+    mask.masked_fill_(allowed, 0.0 if dtype.is_floating_point else 0)
+    return mask.unsqueeze(0).unsqueeze(0)
