@@ -22,6 +22,7 @@ class BlockOutput:
     text: str
     step: int
     is_prompt: list[bool] = field(default_factory=list)
+    is_intermediate: bool = False
 
 
 def _shape_tensor(lens, device):
@@ -60,6 +61,9 @@ class ColaEngine:
         repetition_penalty: float = 1.1,
         block_size: Optional[int] = None,
         stop_text: str = "■",
+        stop_token_id: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
+        stream_steps: int = 0,
         T: float = 1000.0,
         seed: int = None,
     ):
@@ -85,12 +89,13 @@ class ColaEngine:
         scale = vae.scaling_factor
         shift = vae.shifting_factor
 
-        # Pad prompt to multiple of chunk using stop token
-        stop_token_id = self.tokenizer.encode(stop_text).ids[0]
+        # Pad prompt to multiple of chunk
+        if pad_token_id is None and stop_text is not None:
+            pad_token_id = self.tokenizer.encode(stop_text).ids[0]
         ids = list(prompt_ids)
         prompt_len = len(ids)
         pad_len = (chunk - len(ids) % chunk) % chunk
-        ids = ids + [stop_token_id] * pad_len
+        ids = ids + [pad_token_id] * pad_len
 
         input_ids = torch.tensor(ids, dtype=torch.long, device=device)
 
@@ -154,6 +159,7 @@ class ColaEngine:
         generated_text = ""
 
         cfg_scale = 1.0 if prefix_len == 0 else guidance_scale
+        trunc_ids = [t for t in [stop_token_id, pad_token_id] if t is not None]
 
         step = 0
         try:
@@ -164,7 +170,7 @@ class ColaEngine:
                 txt = torch.randn(bs, self.latent_dim, device=device)
 
                 # Euler denoising loop
-                for t_curr, t_next in zip(timesteps[:-1], timesteps[1:]):
+                for euler_step, (t_curr, t_next) in enumerate(zip(timesteps[:-1], timesteps[1:])):
                     ts_batch = torch.full((bs,), t_curr, device=device)
                     dt = (float(t_curr) - float(t_next)) / max(T, 1.0)
 
@@ -203,6 +209,34 @@ class ColaEngine:
 
                     txt = txt_next
 
+                    # Intermediate x0 streaming
+                    if (stream_steps > 0
+                            and (euler_step + 1) % stream_steps == 0
+                            and (euler_step + 1) < timestep_num):
+                        with torch.autocast("cuda", dtype=torch.bfloat16):
+                            inter_decoded = vae.decode(
+                                z=txt,
+                                txt_shape=txt_shape_cum,
+                                txt_q_shape=txt_q_shape_block,
+                                update_kv=False,
+                            )
+                        inter_logits = inter_decoded.view(1, bs * patch_size, -1)
+                        inter_ids = inter_logits.argmax(dim=-1)[0].tolist()
+                        if step == 0 and has_repaint:
+                            inter_gen_ids = inter_ids[trim_tokens:]
+                        else:
+                            inter_gen_ids = inter_ids
+                        for tid in trunc_ids:
+                            if tid in inter_gen_ids:
+                                inter_gen_ids = inter_gen_ids[:inter_gen_ids.index(tid)]
+                        inter_text = self.tokenizer.decode(inter_gen_ids) if inter_gen_ids else ""
+                        yield BlockOutput(
+                            token_ids=inter_gen_ids,
+                            text=inter_text,
+                            step=step,
+                            is_intermediate=True,
+                        )
+
                 # Decode block via VAE
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     decoded = vae.decode(
@@ -235,18 +269,35 @@ class ColaEngine:
                 else:
                     is_prompt = [False] * len(all_block_ids)
                     gen_token_ids = all_block_ids
+
+                # Truncate at stop/pad token if found
+                should_stop = False
+                first_trunc = len(gen_token_ids)
+                for tid in trunc_ids:
+                    if tid in gen_token_ids:
+                        first_trunc = min(first_trunc, gen_token_ids.index(tid))
+                if first_trunc < len(gen_token_ids):
+                    gen_token_ids = gen_token_ids[:first_trunc]
+                    should_stop = True
+
                 block_text = self.tokenizer.decode(gen_token_ids)
 
-                # Update KV cache with denoised block
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    _ = dit(
-                        txt=txt.to(torch.bfloat16),
-                        txt_shape=txt_shape_cum,
-                        txt_q_shape=txt_q_shape_block,
-                        timestep=torch.zeros(bs, device=device, dtype=torch.bfloat16),
-                        update_kv=True,
-                        use_kv_cache=True,
-                    )
+                # Check text-based stop
+                if stop_text and stop_text in (generated_text + block_text):
+                    block_text = block_text[: block_text.index(stop_text)] if stop_text in block_text else block_text
+                    should_stop = True
+
+                # Update KV cache (skip if stopping)
+                if not should_stop:
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        _ = dit(
+                            txt=txt.to(torch.bfloat16),
+                            txt_shape=txt_shape_cum,
+                            txt_q_shape=txt_q_shape_block,
+                            timestep=torch.zeros(bs, device=device, dtype=torch.bfloat16),
+                            update_kv=True,
+                            use_kv_cache=True,
+                        )
 
                 yield BlockOutput(
                     token_ids=gen_token_ids,
@@ -255,12 +306,13 @@ class ColaEngine:
                     is_prompt=is_prompt,
                 )
 
+                if should_stop:
+                    break
+
                 generated_text += block_text
                 step += 1
                 cfg_scale = guidance_scale
 
-                if stop_text and stop_text in generated_text:
-                    break
                 if step * bs * patch_size >= max_new_tokens:
                     break
 

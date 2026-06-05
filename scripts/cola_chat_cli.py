@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import sys
 import torch
 from tokenizers import Tokenizer
 
@@ -29,10 +30,10 @@ parser.add_argument("--chat-format", type=str, default="text", choices=["text", 
 parser.add_argument("--prompt", type=str, default=None, help="Single-shot prompt (non-interactive)")
 parser.add_argument("--system-prompt", type=str, default="",
                     help="System prompt prepended to conversation (default: none)")
+parser.add_argument("--stream-steps", type=int, default=0,
+                    help="Stream intermediate x0 every N denoising steps (0=disabled)")
 parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
 args = parser.parse_args()
-
-STOP_TEXT = "■" if args.chat_format == "text" else "<|im_end|>"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -40,6 +41,20 @@ print("Loading models...")
 dit = ColaDiTModel.from_pretrained(args.dit_path).to(device).eval()
 vae = ColaTextVAEModel.from_pretrained(args.vae_path).to(device).eval()
 tokenizer = Tokenizer.from_file(args.tokenizer_path)
+
+# Auto-detect SFT config from model, CLI args override
+chat_format = args.chat_format or getattr(dit.config, "sft_chat_format", "text")
+pad_with_stop = getattr(dit.config, "sft_pad_with_stop", False)
+stop_token_id = getattr(dit.config, "sft_stop_token_id", None)
+
+if chat_format == "text":
+    STOP_TEXT = "■"
+    STOP_TOKEN_ID = stop_token_id or 47774
+    PAD_TOKEN_ID = 47774
+else:
+    STOP_TEXT = None
+    STOP_TOKEN_ID = stop_token_id or 100265
+    PAD_TOKEN_ID = 100265 if pad_with_stop else 100277
 
 engine = ColaEngine(dit, vae, tokenizer)
 print(f"DiT: {args.dit_path}")
@@ -80,8 +95,10 @@ def generate_response(prompt_text):
     prompt_ids = tokenizer.encode(prompt_text).ids
     response = ""
     printed = 0
-    stop_tokens = [STOP_TEXT, "User:", "\nUser"]
+    stop_tokens = [s for s in [STOP_TEXT, "User:", "\nUser"] if s is not None]
     done = False
+    intermediate_len = 0
+    is_tty = sys.stdout.isatty()
     for block in engine.generate(
         prompt_ids,
         max_new_tokens=args.max_new_tokens,
@@ -92,20 +109,36 @@ def generate_response(prompt_text):
         top_p=args.top_p,
         block_size=args.block_size,
         stop_text=STOP_TEXT,
+        stop_token_id=STOP_TOKEN_ID,
+        pad_token_id=PAD_TOKEN_ID,
+        stream_steps=args.stream_steps,
         seed=args.seed,
     ):
-        response += block.text
-        for st in stop_tokens:
-            if st in response:
-                response = response[: response.index(st)]
-                done = True
+        if block.is_intermediate:
+            if not is_tty:
+                continue
+            if intermediate_len > 0:
+                sys.stdout.write('\b' * intermediate_len + ' ' * intermediate_len + '\b' * intermediate_len)
+            preview = block.text.replace('\n', '').replace('\r', '')
+            sys.stdout.write(preview)
+            sys.stdout.flush()
+            intermediate_len = len(preview)
+        else:
+            if intermediate_len > 0 and is_tty:
+                sys.stdout.write('\b' * intermediate_len + ' ' * intermediate_len + '\b' * intermediate_len)
+                intermediate_len = 0
+            response += block.text
+            for st in stop_tokens:
+                if st in response:
+                    response = response[: response.index(st)]
+                    done = True
+                    break
+            new_text = response[printed:]
+            if new_text:
+                print(new_text, end="", flush=True)
+            printed = len(response)
+            if done:
                 break
-        new_text = response[printed:]
-        if new_text:
-            print(new_text, end="", flush=True)
-        printed = len(response)
-        if done:
-            break
     print()
     return response.strip()
 
