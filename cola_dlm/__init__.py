@@ -52,6 +52,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from .attention_utils import (
+    create_2l_block_causal_mask,
     create_na_block_causal_mask,
     cu_seqlens,
     get_seqlen,
@@ -100,6 +101,7 @@ __all__ = [
     "ColaTextVAEConfig",
     "ColaTextVAEModel",
     "apply_prompt_template",
+    "create_2l_block_causal_mask",
     "create_na_block_causal_mask",
     "cu_seqlens",
     "generate_task_repaint_inference",
