@@ -66,6 +66,8 @@ parser.add_argument("--warmup-ratio", type=float, default=0.05)
 parser.add_argument("--warmdown-ratio", type=float, default=0.3)
 parser.add_argument("--final-lr-frac", type=float, default=0.0)
 # Flow matching
+# Note: paper recommends logit-normal with loc=1.0 for pretraining (d=16),
+# but in preliminary SFT experiments loc=0.0 works better than loc=1.0.
 parser.add_argument("--timestep-dist", type=str, default="logit_normal", choices=["logit_normal", "uniform"])
 parser.add_argument("--logit-normal-loc", type=float, default=0.0)
 parser.add_argument("--logit-normal-scale", type=float, default=1.0)

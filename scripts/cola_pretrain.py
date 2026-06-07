@@ -2,14 +2,20 @@
 Train Cola-DLM DiT from scratch on ClimbMix-400B data.
 
 Freezes a pretrained VAE, randomly initializes a DiT, and trains it using
-flow matching with the 2L trick. Uses Muon optimizer for matrix params and
-AdamW for scalars/embeddings (nanochat-style), with auto-computed batch size
-and training horizon.
+flow matching with the 2L trick. Supports two optimizer modes:
+
+  --optimizer=muon  (default)
+      Muon for matrix params + AdamW for scalars (nanochat-style).
+      DistMuonAdamW handles gradient sync — no DDP wrapper.
+
+  --optimizer=adamw
+      Standard AdamW for all params (Cola paper-style).
+      Uses DDP wrapper for gradient sync.
 
 Single-GPU:
     python scripts/cola_pretrain.py --num-iterations=100 --run=dummy
 
-Multi-GPU (DistMuonAdamW handles gradient sync — no DDP wrapper):
+Multi-GPU:
     torchrun --standalone --nproc_per_node=8 scripts/cola_pretrain.py --run=my_run
 """
 
@@ -52,17 +58,22 @@ parser.add_argument("--device-batch-size", type=int, default=4)
 parser.add_argument("--total-batch-size", type=int, default=-1, help="-1 = auto from scaling law")
 parser.add_argument("--max-seq-len", type=int, default=512)
 # Optimizer
+parser.add_argument("--optimizer", type=str, default="muon", choices=["muon", "adamw"],
+                    help="'muon': nanochat-style Muon+AdamW. 'adamw': paper-style AdamW.")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="Muon LR for 2D params")
 parser.add_argument("--scalar-lr", type=float, default=0.3, help="AdamW LR for 1D/scalar params")
-parser.add_argument("--weight-decay", type=float, default=0.28, help="Muon weight decay")
-parser.add_argument("--grad-clip", type=float, default=1.0)
+parser.add_argument("--adamw-lr", type=float, default=1.5e-4, help="AdamW mode: peak LR")
+parser.add_argument("--adamw-warmup-steps", type=int, default=5000, help="AdamW mode: warmup steps")
+parser.add_argument("--weight-decay", type=float, default=0.28, help="Muon weight decay (AdamW mode: 0.01)")
+parser.add_argument("--grad-clip", type=float, default=0.0,
+                    help="Gradient norm clip (0 = disabled). Muon default: 0. AdamW default: 1.0.")
 # Schedule
 parser.add_argument("--warmup-steps", type=int, default=40)
 parser.add_argument("--warmdown-ratio", type=float, default=0.65)
 parser.add_argument("--final-lr-frac", type=float, default=0.05)
 # Flow matching
 parser.add_argument("--timestep-dist", type=str, default="logit_normal", choices=["logit_normal", "uniform"])
-parser.add_argument("--logit-normal-loc", type=float, default=0.0)
+parser.add_argument("--logit-normal-loc", type=float, default=1.0)
 parser.add_argument("--logit-normal-scale", type=float, default=1.0)
 parser.add_argument("--T", type=float, default=1000.0)
 # VAE
@@ -150,7 +161,7 @@ BLOCK_SIZES = [2 ** i for i in range(n_candidates)]
 if args.block_size_probs is not None:
     BLOCK_SIZE_PROBS = [float(x) for x in args.block_size_probs.split(",")]
 else:
-    BLOCK_SIZE_PROBS = [0.1] + [0.0] + [0.3] * (n_candidates - 2)
+    BLOCK_SIZE_PROBS = [0.0] * (n_candidates - 1) + [1.0]
 assert len(BLOCK_SIZE_PROBS) == n_candidates
 assert abs(sum(BLOCK_SIZE_PROBS) - 1.0) < 1e-6
 
@@ -162,11 +173,13 @@ print0(f"VAE: {sum(p.numel() for p in vae.parameters()):,} params (frozen)")
 # ---------------------------------------------------------------------------
 # Batch size and training horizon auto-computation
 # ---------------------------------------------------------------------------
-B_REF = 2 ** 19  # reference batch size in tokens (nanochat d12)
+# Reference calibration from nanochat d12 (Power Lines paper: Bopt ∝ D^0.383)
+D12_SCALING_PARAMS = 110_100_912  # nanochat d12 transformer_matrices + lm_head
+B_REF = 2 ** 19  # optimal batch size at d12 (~524K tokens)
 target_tokens = int(args.target_param_data_ratio * num_params)
 
 if args.total_batch_size == -1:
-    D_REF = args.target_param_data_ratio * B_REF
+    D_REF = args.target_param_data_ratio * D12_SCALING_PARAMS
     predicted = B_REF * (target_tokens / D_REF) ** 0.383
     total_batch_tokens = 2 ** round(math.log2(predicted))
 else:
@@ -186,66 +199,123 @@ else:
 print0(f"Batch: {args.device_batch_size} x {grad_accum_steps} accum x {ddp_world_size} GPUs = {effective_batch_tokens:,} tokens/step")
 
 # ---------------------------------------------------------------------------
-# Optimizer: Muon for 2D, AdamW for 1D/scalar
+# Optimizer setup
 # ---------------------------------------------------------------------------
-from cola_dlm.optim import MuonAdamW, DistMuonAdamW
+orig_dit = dit
+use_muon = args.optimizer == "muon"
 
-muon_groups = {}  # shape -> [params]
-adamw_params = []
+if use_muon:
+    from cola_dlm.optim import MuonAdamW, DistMuonAdamW
 
-for name, p in dit.named_parameters():
-    if not p.requires_grad:
-        continue
-    if p.ndim == 2:
-        s = p.shape
-        if s not in muon_groups:
-            muon_groups[s] = []
-        muon_groups[s].append(p)
+    # LR batch scaling (nanochat: η ∝ √(B/B_ref))
+    batch_lr_scale = (effective_batch_tokens / B_REF) ** 0.5
+
+    # Weight decay scaling via T_epoch framework
+    D_REF_wd = args.target_param_data_ratio * D12_SCALING_PARAMS
+    weight_decay_scaled = args.weight_decay * math.sqrt(effective_batch_tokens / B_REF) * (D_REF_wd / target_tokens)
+    print0(f"Muon: batch_lr_scale={batch_lr_scale:.4f}, weight_decay_scaled={weight_decay_scaled:.6f}")
+
+    muon_groups = {}
+    adamw_params = []
+    for name, p in dit.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim == 2:
+            s = p.shape
+            if s not in muon_groups:
+                muon_groups[s] = []
+            muon_groups[s].append(p)
+        else:
+            adamw_params.append(p)
+
+    param_groups = []
+    if adamw_params:
+        param_groups.append({
+            "params": adamw_params,
+            "kind": "adamw",
+            "lr": args.scalar_lr * batch_lr_scale,
+            "betas": (0.9, 0.95),
+            "eps": 1e-8,
+            "weight_decay": 0.0,
+            "initial_lr": args.scalar_lr * batch_lr_scale,
+        })
+    for shape, params in muon_groups.items():
+        param_groups.append({
+            "params": params,
+            "kind": "muon",
+            "lr": args.matrix_lr * batch_lr_scale,
+            "momentum": 0.95,
+            "ns_steps": 5,
+            "beta2": 0.9,
+            "weight_decay": weight_decay_scaled,
+            "initial_lr": args.matrix_lr * batch_lr_scale,
+        })
+
+    if ddp_world_size > 1:
+        optimizer = DistMuonAdamW(param_groups)
+        print0("Optimizer: DistMuonAdamW (no DDP wrapper)")
     else:
-        adamw_params.append(p)
+        optimizer = MuonAdamW(param_groups)
+        print0("Optimizer: MuonAdamW (single GPU)")
 
-param_groups = []
-if adamw_params:
-    param_groups.append({
-        "params": adamw_params,
-        "kind": "adamw",
-        "lr": args.scalar_lr,
-        "betas": (0.9, 0.95),
-        "eps": 1e-8,
-        "weight_decay": 0.0,
-        "initial_lr": args.scalar_lr,
-    })
-for shape, params in muon_groups.items():
-    param_groups.append({
-        "params": params,
-        "kind": "muon",
-        "lr": args.matrix_lr,
-        "momentum": 0.95,
-        "ns_steps": 5,
-        "beta2": 0.7,
-        "weight_decay": args.weight_decay,
-        "initial_lr": args.matrix_lr,
-    })
-
-if ddp_world_size > 1:
-    optimizer = DistMuonAdamW(param_groups)
-    print0("Optimizer: DistMuonAdamW (no DDP wrapper)")
 else:
-    optimizer = MuonAdamW(param_groups)
-    print0("Optimizer: MuonAdamW (single GPU)")
+    # AdamW mode (Cola paper-style)
+    wd = 0.01 if args.weight_decay == 0.28 else args.weight_decay
+    optimizer = torch.optim.AdamW(
+        dit.parameters(),
+        lr=args.adamw_lr,
+        betas=(0.9, 0.999),
+        weight_decay=wd,
+    )
+    for group in optimizer.param_groups:
+        group["initial_lr"] = group["lr"]
+
+    if ddp_world_size > 1:
+        dit = torch.nn.parallel.DistributedDataParallel(dit, device_ids=[ddp_local_rank])
+    print0(f"Optimizer: AdamW (lr={args.adamw_lr}, wd={wd})")
+
+    if args.grad_clip == 0.0:
+        args.grad_clip = 1.0
 
 # ---------------------------------------------------------------------------
-# LR schedule: warmup + constant + warmdown (nanochat style)
+# LR schedule
 # ---------------------------------------------------------------------------
 def get_lr_multiplier(step):
-    warmdown_iters = round(args.warmdown_ratio * num_iterations)
-    if step < args.warmup_steps:
-        return (step + 1) / args.warmup_steps
-    elif step <= num_iterations - warmdown_iters:
-        return 1.0
+    if use_muon:
+        # Nanochat-style: warmup + constant + warmdown
+        warmdown_iters = round(args.warmdown_ratio * num_iterations)
+        if step < args.warmup_steps:
+            return (step + 1) / args.warmup_steps
+        elif step <= num_iterations - warmdown_iters:
+            return 1.0
+        else:
+            progress = (num_iterations - step) / warmdown_iters
+            return progress * 1.0 + (1 - progress) * args.final_lr_frac
     else:
-        progress = (num_iterations - step) / warmdown_iters
-        return progress * 1.0 + (1 - progress) * args.final_lr_frac
+        # Cola paper-style: linear warmup + cosine decay
+        warmup = args.adamw_warmup_steps
+        if step < warmup:
+            return (step + 1) / warmup
+        progress = (step - warmup) / max(num_iterations - warmup, 1)
+        min_lr_frac = 1e-5 / args.adamw_lr
+        return min_lr_frac + 0.5 * (1 - min_lr_frac) * (1 + math.cos(math.pi * progress))
+
+
+# Muon-specific schedules (nanochat base_train.py:372-386)
+def get_muon_momentum(step):
+    warmdown_iters = round(args.warmdown_ratio * num_iterations)
+    warmdown_start = num_iterations - warmdown_iters
+    if step < 400:
+        frac = step / 400
+        return (1 - frac) * 0.85 + frac * 0.97
+    elif step >= warmdown_start:
+        progress = (step - warmdown_start) / warmdown_iters
+        return 0.97 * (1 - progress) + 0.90 * progress
+    return 0.97
+
+
+def get_weight_decay_schedule(step):
+    return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * step / num_iterations))
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +510,7 @@ def save_checkpoint(step, val_loss):
     os.makedirs(ckpt_dir, exist_ok=True)
 
     dit_path = os.path.join(ckpt_dir, f"dit_step_{step:06d}")
-    dit.save_pretrained(dit_path)
+    orig_dit.save_pretrained(dit_path)
 
     meta = {"step": step, "val_fm_loss": val_loss, "config": vars(args)}
     with open(os.path.join(ckpt_dir, f"meta_{step:06d}.json"), "w") as f:
@@ -451,7 +521,10 @@ def save_checkpoint(step, val_loss):
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
-print0(f"LR schedule: warmup {args.warmup_steps} steps, warmdown {args.warmdown_ratio}, final {args.final_lr_frac}")
+if use_muon:
+    print0(f"LR schedule (muon): warmup {args.warmup_steps} steps, warmdown {args.warmdown_ratio}, final {args.final_lr_frac}")
+else:
+    print0(f"LR schedule (adamw): warmup {args.adamw_warmup_steps} steps, cosine decay")
 print0(f"Prompt-block prob: {args.prompt_block_prob}")
 print0(f"Starting training for {num_iterations} iterations...")
 
@@ -475,19 +548,46 @@ for step in range(num_iterations):
 
     # --- Training step ---
     for micro_step in range(grad_accum_steps):
-        inputs, _, _ = next(train_loader)
-        batch = prepare_batch(inputs)
-        loss = flow_matching_step(dit, batch)
-        train_loss = loss.detach()
-        (loss / grad_accum_steps).backward()
+        is_last_micro = micro_step == grad_accum_steps - 1
+        if use_muon or ddp_world_size == 1:
+            ctx = nullcontext()
+        else:
+            ctx = nullcontext() if is_last_micro else dit.no_sync()
+        with ctx:
+            inputs, _, _ = next(train_loader)
+            batch = prepare_batch(inputs)
+            loss = flow_matching_step(dit, batch)
+            train_loss = loss.detach()
+            (loss / grad_accum_steps).backward()
 
     # LR update
     lrm = get_lr_multiplier(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
+        if use_muon and group.get("kind") == "muon":
+            group["momentum"] = get_muon_momentum(step)
+            group["weight_decay"] = get_weight_decay_schedule(step)
 
-    # Optimizer step (DistMuonAdamW handles gradient sync)
-    torch.nn.utils.clip_grad_norm_(dit.parameters(), args.grad_clip)
+    # Gradient clipping
+    if args.grad_clip > 0:
+        clip_params = (orig_dit if ddp_world_size > 1 else dit).parameters()
+        if use_muon and ddp_world_size > 1:
+            # Global gradient norm via all-reduce (grads not yet synced by DistMuonAdamW)
+            local_norm_sq = sum(
+                p.grad.detach().norm() ** 2 for p in clip_params if p.grad is not None
+            )
+            global_norm_sq = torch.tensor([local_norm_sq], device=device)
+            dist.all_reduce(global_norm_sq, op=dist.ReduceOp.SUM)
+            global_norm = global_norm_sq.sqrt().item()
+            if global_norm > args.grad_clip:
+                clip_coef = args.grad_clip / (global_norm + 1e-6)
+                for p in orig_dit.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(clip_coef)
+        else:
+            torch.nn.utils.clip_grad_norm_(clip_params, args.grad_clip)
+
+    # Optimizer step
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
 
