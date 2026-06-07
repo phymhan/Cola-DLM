@@ -264,7 +264,7 @@ def render_conversation(conversation, max_tokens, chat_format="text"):
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from tasks.common import TaskMixture
 from tasks.gsm8k import GSM8K
 from tasks.mmlu import MMLU
