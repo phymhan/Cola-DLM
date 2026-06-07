@@ -32,6 +32,13 @@ def str2bool(v):
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
+
+def get_cache_dir():
+    """Return Cola-DLM cache directory, default to ./cache/."""
+    d = os.environ.get("COLA_CACHE_DIR", os.path.join(os.path.dirname(os.path.dirname(__file__)), "cache"))
+    os.makedirs(d, exist_ok=True)
+    return d
+
 import torch
 import torch.distributed as dist
 
@@ -44,7 +51,7 @@ parser.add_argument("--dit-path", type=str, default="hf_models/cola_dlm/cola_dit
 parser.add_argument("--vae-path", type=str, default="hf_models/cola_dlm/cola_vae")
 parser.add_argument("--tokenizer-path", type=str, default="hf_models/tokenizer.json")
 # Output
-parser.add_argument("--output-dir", type=str, default="cola_sft_checkpoints")
+parser.add_argument("--output-dir", type=str, default=None, help="default: $COLA_CACHE_DIR/cola_sft_checkpoints")
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' = no logging)")
 # Training
 parser.add_argument("--num-iterations", type=int, default=-1, help="-1 = full epoch")
@@ -88,6 +95,11 @@ parser.add_argument("--block-size-probs", type=str, default=None,
                     help="comma-separated probs for block sizes 1,2,4,...,block_size. "
                          "Length must be log2(block_size)+1. Default: 0.1,0,0.3,0.3,0.3")
 args = parser.parse_args()
+
+# Resolve defaults that depend on cache dir
+cache_dir = get_cache_dir()
+if args.output_dir is None:
+    args.output_dir = os.path.join(cache_dir, "cola_sft_checkpoints")
 
 # ---------------------------------------------------------------------------
 # DDP / device init
@@ -266,15 +278,41 @@ def render_conversation(conversation, max_tokens, chat_format="text"):
 # ---------------------------------------------------------------------------
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from tasks.common import TaskMixture
+from tasks.customjson import CustomJSON
 from tasks.gsm8k import GSM8K
 from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
 from tasks.spellingbee import SimpleSpelling, SpellingBee
 
+# Download identity conversations if not present, adapt for Cola
+IDENTITY_URL = "https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl"
+identity_path = os.path.join(cache_dir, "identity_conversations_cola.jsonl")
+if not os.path.exists(identity_path):
+    import urllib.request
+    raw_path = os.path.join(cache_dir, "identity_conversations_raw.jsonl")
+    print0(f"Downloading identity conversations...")
+    urllib.request.urlretrieve(IDENTITY_URL, raw_path)
+    replacements = {
+        "nanochat": "Cola",
+        "Nanochat": "Cola",
+        "NanoChat": "Cola",
+        "Andrej Karpathy": "the Cola team",
+        "andrej karpathy": "the Cola team",
+        "Karpathy": "the Cola team",
+    }
+    with open(raw_path, "r") as fin, open(identity_path, "w") as fout:
+        for line in fin:
+            for old, new in replacements.items():
+                line = line.replace(old, new)
+            fout.write(line)
+    print0(f"Saved Cola identity conversations to {identity_path}")
+
 print0("Loading datasets...")
 train_dataset = TaskMixture(
     [
         SmolTalk(split="train"),
+        CustomJSON(filepath=identity_path),
+        CustomJSON(filepath=identity_path),  # 2 epochs
         *[MMLU(subset="all", split="auxiliary_train") for _ in range(args.mmlu_epochs)],
         *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)],
         SimpleSpelling(size=200000, split="train"),
