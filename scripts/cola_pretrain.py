@@ -58,7 +58,7 @@ parser.add_argument("--device-batch-size", type=int, default=4)
 parser.add_argument("--total-batch-size", type=int, default=-1, help="-1 = auto from scaling law")
 parser.add_argument("--max-seq-len", type=int, default=512)
 # Optimizer
-parser.add_argument("--optimizer", type=str, default="muon", choices=["muon", "adamw"],
+parser.add_argument("--optimizer", type=str, default="adamw", choices=["muon", "adamw"],
                     help="'muon': nanochat-style Muon+AdamW. 'adamw': paper-style AdamW.")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="Muon LR for 2D params")
 parser.add_argument("--scalar-lr", type=float, default=0.3, help="AdamW LR for 1D/scalar params")
@@ -357,12 +357,15 @@ def sample_block_size():
 # ---------------------------------------------------------------------------
 # Noisy copy construction
 # ---------------------------------------------------------------------------
-def build_noisy_sample_pretrain(z_0, t_val, z_1, sample_block_size):
+def build_noisy_sample_pretrain(z_0, t_val, z_1, sample_block_size, unpadded_len=None):
     L = z_0.shape[0]
     z_noisy = (1 - t_val) * z_0 + t_val * z_1
     loss_mask = torch.ones(L, device=z_0.device)
     ts_noisy = torch.full((L,), t_val * T, device=z_0.device)
     target = z_1 - z_0
+
+    if unpadded_len is not None and unpadded_len < L:
+        loss_mask[unpadded_len:] = 0.0
 
     if args.prompt_block_prob > 0:
         for blk_start in range(0, L, sample_block_size):
@@ -372,11 +375,10 @@ def build_noisy_sample_pretrain(z_0, t_val, z_1, sample_block_size):
                 continue
             if random.random() < args.prompt_block_prob:
                 split = random.randint(1, blk_len - 1)
-                for j in range(split):
-                    pos = blk_start + j
-                    z_noisy[pos] = z_0[pos]
-                    ts_noisy[pos] = 0.0
-                    loss_mask[pos] = 0.0
+                s = slice(blk_start, blk_start + split)
+                z_noisy[s] = z_0[s]
+                ts_noisy[s] = 0.0
+                loss_mask[s] = 0.0
 
     return z_noisy, loss_mask, target, ts_noisy
 
@@ -414,7 +416,7 @@ def prepare_batch(inputs):
         else:
             z_0 = enc.latents_list[0].float()
         z_0 = (z_0 - vae.shifting_factor) * vae.scaling_factor
-        batch.append((z_0, z_0.shape[0], bs))
+        batch.append((z_0, z_0.shape[0], bs, L))
     return batch
 
 
@@ -436,10 +438,10 @@ def flow_matching_step(dit_model, batch):
 
     noisy_first = (attn_backend == "flex")
 
-    for i, (z_0, L, bs) in enumerate(batch):
+    for i, (z_0, L, bs, unpadded_len) in enumerate(batch):
         z_1 = torch.randn_like(z_0)
         z_noisy, loss_mask, target_vel, ts_noisy = build_noisy_sample_pretrain(
-            z_0, t[i].item(), z_1, bs
+            z_0, t[i].item(), z_1, bs, unpadded_len=unpadded_len,
         )
 
         if noisy_first:
@@ -528,7 +530,12 @@ def evaluate(dit_model, eval_steps):
         loss = flow_matching_step(dit_model, batch)
         losses.append(loss.item())
     dit_model.train()
-    return sum(losses) / len(losses)
+    avg_loss = sum(losses) / len(losses)
+    if ddp_world_size > 1:
+        loss_tensor = torch.tensor([avg_loss], device=device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+        avg_loss = loss_tensor.item()
+    return avg_loss
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +585,7 @@ for step in range(num_iterations):
         save_checkpoint(step, val_loss)
 
     # --- Training step ---
+    train_loss = 0.0
     for micro_step in range(grad_accum_steps):
         is_last_micro = micro_step == grad_accum_steps - 1
         if use_muon or ddp_world_size == 1:
@@ -588,7 +596,7 @@ for step in range(num_iterations):
             inputs, _, _ = next(train_loader)
             batch = prepare_batch(inputs)
             loss = flow_matching_step(dit, batch)
-            train_loss = loss.detach()
+            train_loss += loss.detach() / grad_accum_steps
             (loss / grad_accum_steps).backward()
 
     # LR update
@@ -608,7 +616,7 @@ for step in range(num_iterations):
                 p.grad.detach().norm() ** 2 for p in clip_params if p.grad is not None
             )
             global_norm_sq = torch.tensor([local_norm_sq], device=device)
-            dist.all_reduce(global_norm_sq, op=dist.ReduceOp.SUM)
+            dist.all_reduce(global_norm_sq, op=dist.ReduceOp.AVG)
             global_norm = global_norm_sq.sqrt().item()
             if global_norm > args.grad_clip:
                 clip_coef = args.grad_clip / (global_norm + 1e-6)
@@ -625,7 +633,7 @@ for step in range(num_iterations):
     dt = time.time() - t0
 
     # Logging
-    smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * train_loss.item()
+    smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * train_loss
     debiased = smooth_loss / (1 - ema_beta ** (step + 1))
 
     if step % 10 == 0 or last_step:
@@ -634,7 +642,7 @@ for step in range(num_iterations):
     wandb_run.log({
         "step": step,
         "train/loss": debiased,
-        "train/raw_loss": train_loss.item(),
+        "train/raw_loss": train_loss,
         "train/lr_multiplier": lrm,
         "train/dt": dt,
     })

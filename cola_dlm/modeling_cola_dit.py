@@ -704,6 +704,10 @@ class ColaDiTModel(PreTrainedModel):
 
         # Build NA attention mask once per forward — identical for every block.
         if attn_mask_override is not None:
+            assert self.txt_in.patch_size == 1, (
+                "attn_mask_override assumes patch_size=1; with patch_size>1 the "
+                "mask dimensions would not match the patchified sequence lengths"
+            )
             attn_mask = attn_mask_override
         else:
             attn_mask = create_na_block_causal_mask(

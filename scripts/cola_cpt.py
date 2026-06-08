@@ -66,6 +66,9 @@ parser.add_argument("--eval-steps", type=int, default=20)
 parser.add_argument("--save-every", type=int, default=10000, help="-1 = save only at end")
 # Data
 parser.add_argument("--data-dir", type=str, default="cache_nanochat/base_data_climbmix")
+# Attention backend
+parser.add_argument("--attn-backend", type=str, default="naive", choices=["naive", "sdpa", "flex"],
+                    help="Attention backend: 'naive' (manual matmul), 'sdpa' (PyTorch SDPA), 'flex' (FlexAttention)")
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -106,6 +109,14 @@ else:
 from cola_dlm import ColaDiTModel, ColaTextVAEModel
 from cola_dlm.attention_utils import create_2l_block_causal_mask
 
+attn_backend = args.attn_backend
+if attn_backend != "naive":
+    from cola_dlm.modeling_cola_dit import set_attn_backend
+    set_attn_backend(attn_backend)
+    print0(f"Attention backend: {attn_backend}")
+if attn_backend == "flex":
+    from cola_dlm.attention_utils import create_2l_flex_block_mask
+
 print0("Loading models...")
 vae = ColaTextVAEModel.from_pretrained(args.vae_path).to(device).eval()
 for p in vae.parameters():
@@ -126,7 +137,7 @@ BLOCK_SIZES = [2 ** i for i in range(n_candidates)]
 if args.block_size_probs is not None:
     BLOCK_SIZE_PROBS = [float(x) for x in args.block_size_probs.split(",")]
 else:
-    BLOCK_SIZE_PROBS = [0.1] + [0.0] + [0.3] * (n_candidates - 2)
+    BLOCK_SIZE_PROBS = [0.0] * (n_candidates - 1) + [1.0]
 assert len(BLOCK_SIZE_PROBS) == n_candidates
 assert abs(sum(BLOCK_SIZE_PROBS) - 1.0) < 1e-6
 
@@ -212,13 +223,11 @@ def build_noisy_sample_pretrain(z_0, t_val, z_1, sample_block_size):
             if blk_len <= 1:
                 continue
             if random.random() < args.prompt_block_prob:
-                # Simulate [P, R] boundary: random split point
                 split = random.randint(1, blk_len - 1)
-                for j in range(split):
-                    pos = blk_start + j
-                    z_noisy[pos] = z_0[pos]
-                    ts_noisy[pos] = 0.0
-                    loss_mask[pos] = 0.0
+                s = slice(blk_start, blk_start + split)
+                z_noisy[s] = z_0[s]
+                ts_noisy[s] = 0.0
+                loss_mask[s] = 0.0
 
     return z_noisy, loss_mask, target, ts_noisy
 
@@ -279,13 +288,21 @@ def flow_matching_step(dit_model, batch):
     q_pos_list = []
     ts_list = []
 
+    noisy_first = (attn_backend == "flex")
+
     for i, (z_0, L, bs) in enumerate(batch):
         z_1 = torch.randn_like(z_0)
         z_noisy, loss_mask, target_vel, ts_noisy = build_noisy_sample_pretrain(
             z_0, t[i].item(), z_1, bs
         )
 
-        extended_list.append(torch.cat([z_0.detach(), z_noisy], dim=0))
+        if noisy_first:
+            extended_list.append(torch.cat([z_noisy, z_0.detach()], dim=0))
+            ts_list.append(torch.cat([ts_noisy, torch.zeros(L, device=device)]))
+        else:
+            extended_list.append(torch.cat([z_0.detach(), z_noisy], dim=0))
+            ts_list.append(torch.cat([torch.zeros(L, device=device), ts_noisy]))
+
         target_list.append(target_vel)
         mask_list.append(loss_mask)
         seq_lens.append(L)
@@ -294,7 +311,6 @@ def flow_matching_step(dit_model, batch):
         positions = torch.arange(L, device=device)
         k_pos_list.append(torch.cat([positions, positions]))
         q_pos_list.append(torch.cat([positions, positions]))
-        ts_list.append(torch.cat([torch.zeros(L, device=device), ts_noisy]))
 
     txt = torch.cat(extended_list, dim=0)
     ext_lens = [2 * sl for sl in seq_lens]
@@ -305,11 +321,18 @@ def flow_matching_step(dit_model, batch):
     q_position_ids = torch.cat(q_pos_list, dim=0)
     timestep = torch.cat(ts_list, dim=0)
 
-    attn_mask = create_2l_block_causal_mask(
-        txt_shape, txt_q_shape,
-        seq_lens=seq_lens, block_size=block_sizes_list,
-        dtype=torch.bfloat16, device=device,
-    )
+    if attn_backend == "flex":
+        attn_mask = create_2l_flex_block_mask(
+            txt_shape, txt_q_shape,
+            seq_lens=seq_lens, block_size=block_sizes_list,
+            device=device,
+        )
+    else:
+        attn_mask = create_2l_block_causal_mask(
+            txt_shape, txt_q_shape,
+            seq_lens=seq_lens, block_size=block_sizes_list,
+            dtype=torch.bfloat16, device=device,
+        )
 
     with torch.autocast("cuda", dtype=torch.bfloat16):
         out = dit_model(
@@ -326,7 +349,10 @@ def flow_matching_step(dit_model, batch):
     offset = 0
     for i, sl in enumerate(seq_lens):
         sample_out = out.txt_sample[offset : offset + 2 * sl]
-        pred_list.append(sample_out[sl:])
+        if noisy_first:
+            pred_list.append(sample_out[:sl])
+        else:
+            pred_list.append(sample_out[sl:])
         offset += 2 * sl
 
     pred = torch.cat(pred_list, dim=0).float()
@@ -353,7 +379,12 @@ def evaluate(dit_model, eval_steps):
         loss = flow_matching_step(dit_model, batch)
         losses.append(loss.item())
     dit_model.train()
-    return sum(losses) / len(losses)
+    avg_loss = sum(losses) / len(losses)
+    if ddp_world_size > 1:
+        loss_tensor = torch.tensor([avg_loss], device=device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+        avg_loss = loss_tensor.item()
+    return avg_loss
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +435,7 @@ for step in range(args.num_iterations):
         save_checkpoint(step, val_loss)
 
     # --- Training step ---
+    train_loss = 0.0
     for micro_step in range(grad_accum_steps):
         is_last_micro = micro_step == grad_accum_steps - 1
         ctx = nullcontext() if (is_last_micro or ddp_world_size == 1) else dit.no_sync()
@@ -411,7 +443,7 @@ for step in range(args.num_iterations):
             inputs, _, _ = next(train_loader)
             batch = prepare_batch(inputs)
             loss = flow_matching_step(dit, batch)
-            train_loss = loss.detach()
+            train_loss += loss.detach() / grad_accum_steps
             (loss / grad_accum_steps).backward()
 
     # LR update
@@ -429,7 +461,8 @@ for step in range(args.num_iterations):
     dt = time.time() - t0
 
     # Logging
-    smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * train_loss.item()
+    train_loss_val = train_loss.item() if torch.is_tensor(train_loss) else train_loss
+    smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * train_loss_val
     debiased = smooth_loss / (1 - ema_beta ** (step + 1))
 
     if step % 10 == 0 or last_step:
@@ -438,7 +471,7 @@ for step in range(args.num_iterations):
     wandb_run.log({
         "step": step,
         "train/loss": debiased,
-        "train/raw_loss": train_loss.item(),
+        "train/raw_loss": train_loss_val,
         "train/lr": lr,
         "train/dt": dt,
     })
