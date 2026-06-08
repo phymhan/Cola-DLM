@@ -88,6 +88,9 @@ parser.add_argument("--eval-steps", type=int, default=20)
 parser.add_argument("--save-every", type=int, default=-1, help="-1 = save only at end")
 # Data
 parser.add_argument("--data-dir", type=str, default="cache_nanochat/base_data_climbmix")
+# Attention backend
+parser.add_argument("--attn-backend", type=str, default="naive", choices=["naive", "sdpa", "flex"],
+                    help="Attention backend: 'naive' (manual matmul), 'sdpa' (PyTorch SDPA), 'flex' (FlexAttention)")
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -128,6 +131,14 @@ else:
 from cola_dlm import ColaTextVAEModel, ColaDiTModel
 from cola_dlm.configuration_cola_dit import ColaDiTConfig
 from cola_dlm.attention_utils import create_2l_block_causal_mask
+
+attn_backend = args.attn_backend
+if attn_backend != "naive":
+    from cola_dlm.modeling_cola_dit import set_attn_backend
+    set_attn_backend(attn_backend)
+    print0(f"Attention backend: {attn_backend}")
+if attn_backend == "flex":
+    from cola_dlm.attention_utils import create_2l_flex_block_mask
 
 print0("Loading VAE...")
 vae = ColaTextVAEModel.from_pretrained(args.vae_path).to(device).eval()
@@ -423,13 +434,23 @@ def flow_matching_step(dit_model, batch):
     q_pos_list = []
     ts_list = []
 
+    noisy_first = (attn_backend == "flex")
+
     for i, (z_0, L, bs) in enumerate(batch):
         z_1 = torch.randn_like(z_0)
         z_noisy, loss_mask, target_vel, ts_noisy = build_noisy_sample_pretrain(
             z_0, t[i].item(), z_1, bs
         )
 
-        extended_list.append(torch.cat([z_0.detach(), z_noisy], dim=0))
+        if noisy_first:
+            # Fast-dLLM v2 layout: [xt(noisy) | x0(clean)]
+            extended_list.append(torch.cat([z_noisy, z_0.detach()], dim=0))
+            ts_list.append(torch.cat([ts_noisy, torch.zeros(L, device=device)]))
+        else:
+            # Cola layout: [x0(clean) | xt(noisy)]
+            extended_list.append(torch.cat([z_0.detach(), z_noisy], dim=0))
+            ts_list.append(torch.cat([torch.zeros(L, device=device), ts_noisy]))
+
         target_list.append(target_vel)
         mask_list.append(loss_mask)
         seq_lens.append(L)
@@ -438,7 +459,6 @@ def flow_matching_step(dit_model, batch):
         positions = torch.arange(L, device=device)
         k_pos_list.append(torch.cat([positions, positions]))
         q_pos_list.append(torch.cat([positions, positions]))
-        ts_list.append(torch.cat([torch.zeros(L, device=device), ts_noisy]))
 
     txt = torch.cat(extended_list, dim=0)
     ext_lens = [2 * sl for sl in seq_lens]
@@ -449,11 +469,18 @@ def flow_matching_step(dit_model, batch):
     q_position_ids = torch.cat(q_pos_list, dim=0)
     timestep = torch.cat(ts_list, dim=0)
 
-    attn_mask = create_2l_block_causal_mask(
-        txt_shape, txt_q_shape,
-        seq_lens=seq_lens, block_size=block_sizes_list,
-        dtype=torch.bfloat16, device=device,
-    )
+    if attn_backend == "flex":
+        attn_mask = create_2l_flex_block_mask(
+            txt_shape, txt_q_shape,
+            seq_lens=seq_lens, block_size=block_sizes_list,
+            device=device,
+        )
+    else:
+        attn_mask = create_2l_block_causal_mask(
+            txt_shape, txt_q_shape,
+            seq_lens=seq_lens, block_size=block_sizes_list,
+            dtype=torch.bfloat16, device=device,
+        )
 
     with torch.autocast("cuda", dtype=torch.bfloat16):
         out = dit_model(
@@ -466,11 +493,15 @@ def flow_matching_step(dit_model, batch):
             attn_mask_override=attn_mask,
         )
 
+    # Extract predictions from the noisy copy
     pred_list = []
     offset = 0
     for i, sl in enumerate(seq_lens):
         sample_out = out.txt_sample[offset : offset + 2 * sl]
-        pred_list.append(sample_out[sl:])
+        if noisy_first:
+            pred_list.append(sample_out[:sl])   # v2: noisy is first half
+        else:
+            pred_list.append(sample_out[sl:])   # Cola: noisy is second half
         offset += 2 * sl
 
     pred = torch.cat(pred_list, dim=0).float()
